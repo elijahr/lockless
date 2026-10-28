@@ -60,6 +60,13 @@ var
   gDeferredFastQueue {.global, align: CacheLineBytes.}: ptr BQueue128[pointer, 65536]
   gDeferredOverflowStack {.global, align: CacheLineBytes.}: TreiberStack[pointer]
   gDeferredPendingCount {.global, align: CacheLineBytes.}: Atomic[int64]
+  gActiveBorrowers {.global, align: CacheLineBytes.}: Atomic[int]
+
+proc ll_enter_borrow*() {.exportc: "ll_enter_borrow", cdecl, gcsafe, raises: [].} =
+  discard gActiveBorrowers.fetchAdd(1, moAcquireRelease)
+
+proc ll_exit_borrow*() {.exportc: "ll_exit_borrow", cdecl, gcsafe, raises: [].} =
+  discard gActiveBorrowers.fetchSub(1, moAcquireRelease)
 
 proc ensureDeferredQueue() {.inline, gcsafe, raises: [].} =
   let st = gDeferredFastInitialized.load(moAcquire)
@@ -94,6 +101,9 @@ proc ll_pop_deferred_decref*(out_pyobj: ptr pointer): bool {.
     exportc: "ll_pop_deferred_decref", cdecl, gcsafe, raises: [].} =
   if unlikely(out_pyobj == nil):
     return false
+  if gActiveBorrowers.load(moAcquire) > 0:
+    out_pyobj[] = nil
+    return false
   if gDeferredPendingCount.load(moAcquire) <= 0:
     out_pyobj[] = nil
     return false
@@ -119,6 +129,8 @@ proc ll_pop_deferred_decref_batch*(
     out_pyobjs: ptr pointer, max_count: csize_t
 ): csize_t {.exportc: "ll_pop_deferred_decref_batch", cdecl, gcsafe, raises: [].} =
   if unlikely(out_pyobjs == nil or max_count == 0):
+    return 0
+  if gActiveBorrowers.load(moAcquire) > 0:
     return 0
   let arr = cast[ptr UncheckedArray[pointer]](out_pyobjs)
   var count: csize_t = 0
@@ -698,22 +710,66 @@ proc makeLlKey(kind: uint8, intVal: int64, floatVal: float64, data: pointer, dat
   else:
     result.strVal = ""
 
+proc isFiniteInt64(f: float64): bool {.inline.} =
+  # In IEEE-754, comparisons with NaN always return false.
+  # 9223372036854775808.0 is exactly 2^63, which is the first float64 out of int64 range.
+  f >= -9223372036854775808.0 and f < 9223372036854775808.0
+
+var gPyRichCompareFn {.global.}: proc(a, b: pointer, op: cint): cint {.cdecl, gcsafe, raises: [].}
+
+proc ll_register_py_compare*(
+    fn: proc(a, b: pointer, op: cint): cint {.cdecl, gcsafe, raises: [].}
+) {.exportc: "ll_register_py_compare", cdecl, gcsafe, raises: [].} =
+  gPyRichCompareFn = fn
+
 proc `==`(a, b: LlKey): bool {.inline.} =
   if a.kind != b.kind:
-    # Support numeric int == float equivalence in Python keys if needed, or strict kind
+    # Support numeric int == float equivalence in Python keys when in 64-bit integer range
     if (a.kind == 0 and b.kind == 1):
-      return float64(a.intVal) == b.floatVal and int64(b.floatVal) == a.intVal
+      if a.strVal.len > 0 or not isFiniteInt64(b.floatVal):
+        return false
+      let bi = int64(b.floatVal)
+      return float64(bi) == b.floatVal and bi == a.intVal
     if (a.kind == 1 and b.kind == 0):
-      return a.floatVal == float64(b.intVal) and int64(a.floatVal) == b.intVal
+      if b.strVal.len > 0 or not isFiniteInt64(a.floatVal):
+        return false
+      let ai = int64(a.floatVal)
+      return float64(ai) == a.floatVal and ai == b.intVal
     return false
   case a.kind
-  of 0: return a.intVal == b.intVal
+  of 0:
+    if a.strVal.len == 0 and b.strVal.len == 0:
+      return a.intVal == b.intVal
+    elif a.strVal.len > 0 and b.strVal.len > 0:
+      return a.strVal == b.strVal
+    else:
+      return false
   of 1: return a.floatVal == b.floatVal
+  of 5:
+    if a.intVal != b.intVal:
+      return false
+    if a.strVal.len == 8 and b.strVal.len == 8 and gPyRichCompareFn != nil:
+      var pa, pb: pointer
+      copyMem(addr pa, unsafeAddr a.strVal[0], 8)
+      copyMem(addr pb, unsafeAddr b.strVal[0], 8)
+      if pa == pb:
+        return true
+      return gPyRichCompareFn(pa, pb, 2) == 1 # Py_EQ == 2
+    return a.strVal == b.strVal
   else: return a.strVal == b.strVal
 
 proc cmp(a, b: LlKey): int {.inline.} =
   if a.kind != b.kind:
     if a.kind in {0'u8, 1'u8} and b.kind in {0'u8, 1'u8}:
+      if a.kind == 0 and a.strVal.len > 0:
+        # Big int `< int64.low` (`intVal < 0`) or `> int64.high` (`intVal > 0`) vs float
+        if b.floatVal != b.floatVal: # NaN
+          return -1
+        return (if a.intVal < 0: -1 else: 1)
+      if b.kind == 0 and b.strVal.len > 0:
+        if a.floatVal != a.floatVal: # NaN
+          return 1
+        return (if b.intVal < 0: 1 else: -1)
       let fa = if a.kind == 0: float64(a.intVal) else: a.floatVal
       let fb = if b.kind == 0: float64(b.intVal) else: b.floatVal
       if fa < fb: return -1
@@ -721,11 +777,32 @@ proc cmp(a, b: LlKey): int {.inline.} =
       else: return 0
     return cmp(int(a.kind), int(b.kind))
   case a.kind
-  of 0: return cmp(a.intVal, b.intVal)
+  of 0:
+    if a.strVal.len == 0 and b.strVal.len == 0:
+      return cmp(a.intVal, b.intVal)
+    elif a.strVal.len == 0 and b.strVal.len > 0:
+      return (if b.intVal < 0: 1 else: -1)
+    elif a.strVal.len > 0 and b.strVal.len == 0:
+      return (if a.intVal < 0: -1 else: 1)
+    else:
+      return cmp(a.strVal, b.strVal)
   of 1:
     if a.floatVal < b.floatVal: return -1
     elif a.floatVal > b.floatVal: return 1
     else: return 0
+  of 5:
+    if a.strVal.len == 8 and b.strVal.len == 8 and gPyRichCompareFn != nil:
+      var pa, pb: pointer
+      copyMem(addr pa, unsafeAddr a.strVal[0], 8)
+      copyMem(addr pb, unsafeAddr b.strVal[0], 8)
+      if pa == pb:
+        return 0
+      if gPyRichCompareFn(pa, pb, 2) == 1: # Py_EQ == 2
+        return 0
+      if gPyRichCompareFn(pa, pb, 0) == 1: # Py_LT == 0
+        return -1
+      return 1
+    return cmp(a.strVal, b.strVal)
   else:
     return cmp(a.strVal, b.strVal)
 
@@ -735,12 +812,17 @@ proc `<`(a, b: LlKey): bool {.inline.} =
 proc hash(k: LlKey): Hash {.inline.} =
   case k.kind
   of 0:
-    return hash(k.intVal)
+    if k.strVal.len == 0:
+      return hash(k.intVal)
+    return !$(hash(0) !& hash(k.strVal))
   of 1:
-    let iv = int64(k.floatVal)
-    if float64(iv) == k.floatVal:
-      return hash(iv)
+    if isFiniteInt64(k.floatVal):
+      let iv = int64(k.floatVal)
+      if float64(iv) == k.floatVal:
+        return hash(iv)
     return hash(k.floatVal)
+  of 5:
+    return hash(k.intVal)
   else:
     return !$(hash(int(k.kind)) !& hash(k.strVal))
 
@@ -1222,10 +1304,14 @@ proc ll_skiplist_remove*(
   {.cast(gcsafe).}:
     try:
       let k = makeLlKey(key_kind, key_int, key_float, key_bytes, key_len)
-      if out_val_pyobj != nil:
-        let opt = map.raw[].get(k)
-        out_val_pyobj[] = if opt.isSome and opt.get.holder != nil: opt.get.holder.valObj else: nil
+      # Hold `opt` (`Option[PyKVBox]`) in a local variable across `delete(k)` and
+      # `reclaimNow(th)` so `PyKVHolder.rc >= 1` is maintained until `out_val_pyobj[]`
+      # has been safely extracted, and `PyKVBox.=destroy` retires `keyObj`/`valObj`
+      # cleanly when `opt` exits scope.
+      var opt = map.raw[].get(k)
       if map.raw[].delete(k):
+        if out_val_pyobj != nil:
+          out_val_pyobj[] = if opt.isSome and opt.get.holder != nil: opt.get.holder.valObj else: nil
         let th = map.raw[].getOrRegisterHandle()
         for _ in 0 .. 3:
           discard th.manager.globalEpoch.fetchAdd(1'u64, moRelease)
@@ -1454,6 +1540,9 @@ proc ll_keepalive_cabi*(): int {.exportc: "ll_keepalive_cabi", cdecl, gcsafe, ra
     cast[pointer](lf_token_bucket_refill_rate),
     cast[pointer](lf_leaky_bucket_burst_tolerance_ns),
     cast[pointer](lf_leaky_bucket_leak_rate),
+    cast[pointer](ll_enter_borrow),
+    cast[pointer](ll_exit_borrow),
+    cast[pointer](ll_register_py_compare),
     cast[pointer](ll_retire_pyobj),
     cast[pointer](ll_pop_deferred_decref),
     cast[pointer](ll_pop_deferred_decref_batch),

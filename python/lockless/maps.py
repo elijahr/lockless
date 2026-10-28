@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from typing import Any, Generic, TypeVar
 
@@ -55,7 +56,7 @@ class LaggedError(LocklessError):
 class Subscriber(Generic[T]):
     """Independent reader cursor on a ``BroadcastRing``."""
 
-    __slots__ = ("_closed", "_ptr", "_ring", "_total_skipped")
+    __slots__ = ("__weakref__", "_closed", "_ptr", "_ring", "_total_skipped")
 
     def __init__(self, ring: BroadcastRing[T], ptr: Any) -> None:
         self._ring = ring
@@ -65,11 +66,11 @@ class Subscriber(Generic[T]):
 
     @property
     def is_closed(self) -> bool:
-        return self._closed or self._ptr == ffi.NULL
+        return self._closed or self._ptr == ffi.NULL or self._ring._destroyed
 
     @property
     def lag(self) -> int:
-        if self._closed or self._ptr == ffi.NULL:
+        if self._closed or self._ptr == ffi.NULL or self._ring._destroyed:
             return 0
         return int(lib.ll_broadcast_cursor_lag(self._ptr))
 
@@ -85,13 +86,15 @@ class Subscriber(Generic[T]):
         ``raise_on_lag=True``, raises ``LaggedError(skipped_count)``, otherwise
         transparently fast-forwards and returns the earliest available message.
         """
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("Subscriber is unsubscribed")
+        if self._closed or self._ptr == ffi.NULL or self._ring._destroyed:
+            raise Closed("Subscriber is unsubscribed or BroadcastRing is destroyed")
         out_item = ffi.new("void**")
         out_skipped = ffi.new("size_t*")
         out_res = ffi.new("lf_poll_result_t*")
 
         while True:
+            if self._closed or self._ptr == ffi.NULL or self._ring._destroyed:
+                raise Closed("Subscriber is unsubscribed or BroadcastRing is destroyed")
             enter_borrow()
             try:
                 rc = lib.ll_broadcast_poll(self._ptr, out_item, out_skipped, out_res)
@@ -138,7 +141,8 @@ class Subscriber(Generic[T]):
             ptr = self._ptr
             self._ptr = ffi.NULL
             self._closed = True
-            lib.ll_broadcast_unsubscribe(ptr)
+            if not self._ring._destroyed and self._ring._ptr != ffi.NULL:
+                lib.ll_broadcast_unsubscribe(ptr)
             drain_deferred_decrefs()
 
     close = unsubscribe
@@ -173,7 +177,7 @@ class BroadcastRing(Generic[T]):
         Maximum concurrent subscribers in ``[1, 64]``.
     """
 
-    __slots__ = ("_capacity", "_destroyed", "_max_readers", "_overflow", "_ptr")
+    __slots__ = ("_capacity", "_destroyed", "_max_readers", "_overflow", "_ptr", "_subscribers")
 
     def __init__(
         self,
@@ -213,6 +217,7 @@ class BroadcastRing(Generic[T]):
         self._overflow = norm_overflow
         self._max_readers = max_readers
         self._destroyed = False
+        self._subscribers: weakref.WeakSet[Subscriber[T]] = weakref.WeakSet()
 
     def _check_alive(self) -> None:
         if self._destroyed or self._ptr == ffi.NULL:
@@ -270,7 +275,9 @@ class BroadcastRing(Generic[T]):
         if rc == LF_ERR_REGISTRY_FULL:
             raise Full(f"BroadcastRing max_readers ({self._max_readers}) exceeded")
         CheckStatusError.check(rc, "BroadcastRing.subscribe")
-        return Subscriber(self, out_cur[0])
+        sub = Subscriber(self, out_cur[0])
+        self._subscribers.add(sub)
+        return sub
 
     def close(self) -> None:
         if not self._destroyed and self._ptr != ffi.NULL:
@@ -279,6 +286,9 @@ class BroadcastRing(Generic[T]):
 
     def destroy(self) -> None:
         if not self._destroyed and self._ptr != ffi.NULL:
+            for sub in list(self._subscribers):
+                sub.unsubscribe()
+            self._subscribers.clear()
             ptr = self._ptr
             self._ptr = ffi.NULL
             self._destroyed = True
@@ -664,7 +674,7 @@ class SkipListMap(Generic[K, V]):
     def put(self, key: K, value: V) -> bool:
         """Inserts or updates ``key`` with ``value``, returning ``True`` if newly inserted."""
         self._check_alive()
-        kind, iv, fv, bv = encode_key(key)
+        kind, iv, fv, bv = encode_key(key, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         k_ptr = box_pyobj(key)
         v_ptr = box_pyobj(value)
@@ -682,7 +692,7 @@ class SkipListMap(Generic[K, V]):
     def put_if_absent(self, key: K, value: V) -> V:
         """Atomically inserts ``value`` if ``key`` is absent, returning the settled value."""
         self._check_alive()
-        kind, iv, fv, bv = encode_key(key)
+        kind, iv, fv, bv = encode_key(key, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         k_ptr = box_pyobj(key)
         v_ptr = box_pyobj(value)
@@ -712,7 +722,7 @@ class SkipListMap(Generic[K, V]):
 
     def get(self, key: K, default: Any = None) -> Any:
         self._check_alive()
-        kind, iv, fv, bv = encode_key(key)
+        kind, iv, fv, bv = encode_key(key, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         out_val = ffi.new("void**")
         enter_borrow()
@@ -730,7 +740,7 @@ class SkipListMap(Generic[K, V]):
     def remove(self, key: K) -> V:
         """Removes ``key`` and returns its previous value, or raises ``KeyError``."""
         self._check_alive()
-        kind, iv, fv, bv = encode_key(key)
+        kind, iv, fv, bv = encode_key(key, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         out_val = ffi.new("void**")
         enter_borrow()
@@ -865,7 +875,7 @@ class SkipListSet(Generic[T]):
     def add(self, item: T) -> bool:
         """Adds ``item`` to the set, returning ``True`` if newly inserted or ``False`` if already present."""
         self._check_alive()
-        kind, iv, fv, bv = encode_key(item)
+        kind, iv, fv, bv = encode_key(item, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         item_ptr = box_pyobj(item)
         out_added = ffi.new("bool*")
@@ -879,7 +889,7 @@ class SkipListSet(Generic[T]):
     def remove(self, item: T) -> None:
         """Removes ``item`` from the set, raising ``KeyError`` if absent."""
         self._check_alive()
-        kind, iv, fv, bv = encode_key(item)
+        kind, iv, fv, bv = encode_key(item, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         rc = lib.ll_skiplist_set_remove(self._ptr, kind, iv, fv, c_bytes, len(bv))
         if rc == LF_OK:
@@ -901,7 +911,7 @@ class SkipListSet(Generic[T]):
     def __contains__(self, item: object) -> bool:
         self._check_alive()
         try:
-            kind, iv, fv, bv = encode_key(item)
+            kind, iv, fv, bv = encode_key(item, ordered=True)
         except TypeError:
             return False
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL

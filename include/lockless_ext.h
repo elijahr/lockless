@@ -58,8 +58,12 @@ typedef void (*lf_item_destructor_fn)(void* item, void* user_data);
 typedef void (*lf_bqueue128_destructor_fn)(void* item, void* user_data);
 typedef void (*lf_task_fn)(void* arg);
 typedef void (*lf_for_task_fn)(size_t index, void* arg);
+typedef int (*ll_py_compare_fn)(void* a, void* b, int op);
 
 /* Deferred Py_DecRef queue */
+void ll_enter_borrow(void);
+void ll_exit_borrow(void);
+void ll_register_py_compare(ll_py_compare_fn fn);
 void ll_retire_pyobj(void* pyobj);
 bool ll_pop_deferred_decref(void** out_pyobj);
 size_t ll_pop_deferred_decref_batch(void** out_pyobjs, size_t max_count);
@@ -198,19 +202,19 @@ size_t lf_taskpool_num_workers(lf_taskpool_t* pool);
 /* Rate Limiters */
 lf_token_bucket_t* lf_token_bucket_create(uint64_t capacity, uint64_t refill_rate);
 void lf_token_bucket_destroy(lf_token_bucket_t* bucket);
-void lf_token_bucket_reset(lf_token_bucket_t* bucket);
+void lf_token_bucket_reset(lf_token_bucket_t* bucket, uint64_t tokens);
 bool lf_token_bucket_try_acquire(lf_token_bucket_t* bucket, uint64_t tokens);
 bool lf_token_bucket_acquire_timeout(lf_token_bucket_t* bucket, uint64_t tokens, int64_t max_wait_ns);
 uint64_t lf_token_bucket_available(lf_token_bucket_t* bucket);
 uint64_t lf_token_bucket_capacity(const lf_token_bucket_t* bucket);
 uint64_t lf_token_bucket_refill_rate(const lf_token_bucket_t* bucket);
 
-lf_leaky_bucket_t* lf_leaky_bucket_create(uint64_t capacity, uint64_t leak_rate);
+lf_leaky_bucket_t* lf_leaky_bucket_create(uint64_t burst_tolerance_ns, uint64_t leak_rate);
 void lf_leaky_bucket_destroy(lf_leaky_bucket_t* bucket);
 void lf_leaky_bucket_reset(lf_leaky_bucket_t* bucket);
-bool lf_leaky_bucket_try_acquire(lf_leaky_bucket_t* bucket, uint64_t units);
-bool lf_leaky_bucket_acquire_timeout(lf_leaky_bucket_t* bucket, uint64_t units, int64_t max_wait_ns);
-uint64_t lf_leaky_bucket_water_level_ns(lf_leaky_bucket_t* bucket);
+bool lf_leaky_bucket_try_consume(lf_leaky_bucket_t* bucket, uint64_t weight);
+bool lf_leaky_bucket_consume_timeout(lf_leaky_bucket_t* bucket, uint64_t weight, int64_t max_wait_ns);
+uint64_t lf_leaky_bucket_water_level(lf_leaky_bucket_t* bucket);
 uint64_t lf_leaky_bucket_burst_tolerance_ns(const lf_leaky_bucket_t* bucket);
 uint64_t lf_leaky_bucket_leak_rate(const lf_leaky_bucket_t* bucket);
 

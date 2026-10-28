@@ -195,3 +195,54 @@ def test_mpmc_multithreaded_contention() -> None:
     expected = sorted((p, i) for p in range(num_producers) for i in range(items_per_producer))
     assert len(collected) == total_items
     assert sorted(collected) == expected
+
+
+def test_unbounded_mpmc_direct_multithreaded_and_handle_invalidation() -> None:
+    uq: MpmcQueue[tuple[int, int]] = MpmcQueue(None)
+    prod_handle = uq.producer()
+    cons_handle = uq.consumer()
+
+    num_threads = 4
+    items_per_thread = 100
+
+    # Concurrent threads calling uq.push() and uq.try_pop() directly (using per-thread TLS handles)
+    def push_worker(tid: int) -> None:
+        for i in range(items_per_thread):
+            uq.push((tid, i))
+
+    threads = [threading.Thread(target=push_worker, args=(t,)) for t in range(num_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    popped: list[tuple[int, int]] = []
+    pop_lock = threading.Lock()
+
+    def pop_worker() -> None:
+        local: list[tuple[int, int]] = []
+        while True:
+            item = uq.try_pop()
+            if item is None:
+                break
+            local.append(item)
+        with pop_lock:
+            popped.extend(local)
+
+    pop_threads = [threading.Thread(target=pop_worker) for _ in range(num_threads)]
+    for t in pop_threads:
+        t.start()
+    for t in pop_threads:
+        t.join()
+
+    expected = sorted((t, i) for t in range(num_threads) for i in range(items_per_thread))
+    assert sorted(popped) == expected
+
+    # Destroying the queue must close all open producer/consumer handles
+    uq.destroy()
+    with pytest.raises(Closed):
+        prod_handle.push((0, 0))
+    with pytest.raises(Closed):
+        cons_handle.pop()
+    prod_handle.close()
+    cons_handle.close()

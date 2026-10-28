@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
-import pickle
+import math
+import struct
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -140,8 +142,12 @@ ffi.cdef(
     typedef void (*lf_bqueue128_destructor_fn)(void* item, void* user_data);
     typedef void (*lf_task_fn)(void* arg);
     typedef void (*lf_for_task_fn)(size_t index, void* arg);
+    typedef int (*ll_py_compare_fn)(void* a, void* b, int op);
 
     /* Deferred Py_DecRef queue */
+    void ll_enter_borrow(void);
+    void ll_exit_borrow(void);
+    void ll_register_py_compare(ll_py_compare_fn fn);
     void ll_retire_pyobj(void* pyobj);
     bool ll_pop_deferred_decref(void** out_pyobj);
     size_t ll_pop_deferred_decref_batch(void** out_pyobjs, size_t max_count);
@@ -357,35 +363,64 @@ _Py_DecRef_Ptr = ctypes.pythonapi.Py_DecRef
 _Py_DecRef_Ptr.argtypes = [ctypes.c_void_p]
 _Py_DecRef_Ptr.restype = None
 
+_PyObject_RichCompareBool = ctypes.pythonapi.PyObject_RichCompareBool
+_PyObject_RichCompareBool.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
+_PyObject_RichCompareBool.restype = ctypes.c_int
+
+_PyErr_Clear = ctypes.pythonapi.PyErr_Clear
+_PyErr_Clear.argtypes = []
+_PyErr_Clear.restype = None
+
+
+@ffi.callback("int(void*, void*, int)")
+def _py_rich_compare_cb(a: Any, b: Any, op: int) -> int:
+    addr_a = int(ffi.cast("uintptr_t", a))
+    addr_b = int(ffi.cast("uintptr_t", b))
+    if addr_a == addr_b:
+        return 1 if op == 2 else 0
+    res = int(_PyObject_RichCompareBool(addr_a, addr_b, op))
+    if res < 0:
+        _PyErr_Clear()
+        return 0
+    return res
+
+
+lib.ll_register_py_compare(_py_rich_compare_cb)
+
 # Sentinel wrapper for `None` or `0` (NULL pointer) so raw `void*` slots can
 # distinguish an empty NULL slot from a Python `None` payload.
 _NONE_SENTINEL = object()
 
 _DRAIN_BATCH_SIZE = 256
-_active_borrowers = 0
+_borrow_tls = threading.local()
+
+
+def _tls_borrow_depth() -> int:
+    return getattr(_borrow_tls, "depth", 0)
 
 
 def enter_borrow() -> None:
     """Marks the start of a C-ABI call that returns a borrowed `PyObject*`."""
-    global _active_borrowers
-    _active_borrowers += 1
+    _borrow_tls.depth = getattr(_borrow_tls, "depth", 0) + 1
+    lib.ll_enter_borrow()
 
 
 def exit_borrow() -> None:
     """Marks the completion of unboxing a borrowed `PyObject*` under the GIL."""
-    global _active_borrowers
-    _active_borrowers -= 1
-    if _active_borrowers == 0:
+    depth = getattr(_borrow_tls, "depth", 1) - 1
+    _borrow_tls.depth = depth
+    lib.ll_exit_borrow()
+    if depth == 0:
         drain_deferred_decrefs()
 
 
 def drain_deferred_decrefs() -> int:
     """Drains all pending retired `PyObject*` pointers and calls `Py_DecRef` under the GIL."""
-    if _active_borrowers > 0 or lib.ll_deferred_decref_count() == 0:
+    if _tls_borrow_depth() > 0 or lib.ll_deferred_decref_count() == 0:
         return 0
     total = 0
     buf = ffi.new("void*[]", _DRAIN_BATCH_SIZE)
-    while True:
+    while _tls_borrow_depth() == 0:
         n = int(lib.ll_pop_deferred_decref_batch(buf, _DRAIN_BATCH_SIZE))
         if n == 0:
             break
@@ -456,20 +491,85 @@ def _pyobj_destructor_cb(item: Any, _user_data: Any) -> None:
 # ==============================================================================
 
 
-def encode_key(key: Any) -> tuple[int, int, float, bytes]:
+def _encode_ordered_int(val: int) -> bytes:
+    """Encodes any Python int into order-preserving lexicographical bytes."""
+    if val == 0:
+        return b"\x20"
+    if val > 0:
+        blen = (val.bit_length() + 7) // 8
+        return b"\x30" + blen.to_bytes(8, "big") + val.to_bytes(blen, "big")
+    mag = -val
+    blen = (mag.bit_length() + 7) // 8
+    inv_len = (0xFFFFFFFFFFFFFFFF - blen).to_bytes(8, "big")
+    inv_mag = ((1 << (blen * 8)) - 1 - mag).to_bytes(blen, "big")
+    return b"\x10" + inv_len + inv_mag
+
+
+def _encode_ordered_float(val: float) -> bytes:
+    """Encodes an IEEE-754 float64 into order-preserving lexicographical bytes."""
+    if math.isnan(val):
+        return b"\x39\xff\xff\xff\xff\xff\xff\xff\xff"
+    if val == 0.0:
+        val = 0.0
+    # If val is an exact integer, use the unified integer encoding so `1 == 1.0` inside tuples!
+    if math.isfinite(val) and val.is_integer():
+        return _encode_ordered_int(int(val))
+    (u,) = struct.unpack(">Q", struct.pack(">d", val))
+    if u & (1 << 63):
+        u ^= 0xFFFFFFFFFFFFFFFF
+    else:
+        u ^= 1 << 63
+    return b"\x28" + u.to_bytes(8, "big")
+
+
+def _encode_tuple_elem(elem: Any, *, ordered: bool) -> bytes:
+    """Encodes a tuple element into order-preserving bytes without pickle."""
+    if elem is None:
+        if ordered:
+            raise TypeError("'<' not supported between instances of 'NoneType'")
+        return b"\x05"
+    if isinstance(elem, bool):
+        return _encode_ordered_int(1 if elem else 0)
+    if isinstance(elem, int):
+        return _encode_ordered_int(elem)
+    if isinstance(elem, float):
+        return _encode_ordered_float(elem)
+    if isinstance(elem, str):
+        raw = elem.encode("utf-8").replace(b"\x00", b"\x00\xff")
+        return b"\x40" + raw + b"\x00\x00"
+    if isinstance(elem, bytes):
+        raw = elem.replace(b"\x00", b"\x00\xff")
+        return b"\x50" + raw + b"\x00\x00"
+    if isinstance(elem, tuple):
+        inner = b"".join(_encode_tuple_elem(x, ordered=ordered) for x in elem)
+        return b"\x60" + inner + b"\x00"
+    if ordered:
+        _ = elem < elem
+    raise TypeError(
+        f"Unsupported non-scalar tuple element type {type(elem).__name__!r}; "
+        "tuple keys must contain int, float, bool, str, bytes, or nested tuples"
+    )
+
+
+def encode_key(key: Any, *, ordered: bool = False) -> tuple[int, int, float, bytes]:
     """Encodes a hashable/comparable Python key into `(kind, int_val, float_val, bytes_val)`."""
-    # Checkhashable first so unhashable types (e.g. list, dict) raise TypeError immediately
-    hash(key)
+    # Check hashable first so unhashable types (e.g. list, dict) raise TypeError immediately
+    h = hash(key)
     if isinstance(key, bool):
         return (0, 1 if key else 0, 0.0, b"")
     if isinstance(key, int):
         if -9223372036854775808 <= key <= 9223372036854775807:
             return (0, key, 0.0, b"")
-        return (4, 0, 0.0, str(key).encode("utf-8"))
+        return (0, -1 if key < 0 else 1, 0.0, _encode_ordered_int(key))
     if isinstance(key, float):
         return (1, 0, key, b"")
     if isinstance(key, str):
         return (2, 0, 0.0, key.encode("utf-8"))
     if isinstance(key, bytes):
         return (3, 0, 0.0, key)
-    return (4, 0, 0.0, pickle.dumps(key, protocol=5))
+    if isinstance(key, tuple):
+        encoded = b"".join(_encode_tuple_elem(e, ordered=ordered) for e in key) + b"\x00"
+        return (4, 0, 0.0, encoded)
+    if ordered:
+        _ = key < key
+    return (5, h, 0.0, struct.pack("=Q", id(key)))

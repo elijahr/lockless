@@ -176,10 +176,15 @@ class TaskPool:
         self._check_alive()
         if (
             not isinstance(start, int)
+            or isinstance(start, bool)
             or not isinstance(stop, int)
+            or isinstance(stop, bool)
             or not isinstance(chunk_size, int)
+            or isinstance(chunk_size, bool)
         ):
             raise TypeError("start, stop, and chunk_size must be integers")
+        if start < 0:
+            raise ValueError("start must be non-negative")
         if chunk_size < 0:
             raise ValueError("chunk_size must be non-negative")
         if stop <= start:

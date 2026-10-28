@@ -143,6 +143,29 @@ def test_taskpool_submit_map_and_parallel_for() -> None:
         with pytest.raises(ValueError, match="boom at 7"):
             pool.parallel_for(0, 16, bad_loop)
 
+        # Negative controls for parallel_for start < 0 and bool arguments
+        with pytest.raises(ValueError, match="start must be non-negative"):
+            pool.parallel_for(-5, 10, fill_one)
+        with pytest.raises(TypeError, match="must be integers"):
+            pool.parallel_for(True, 10, fill_one)  # type: ignore[arg-type]
+
+
+def test_channel_async_weakref_gc_cleanup() -> None:
+    import gc
+    import weakref
+
+    async def scenario() -> bool:
+        ch: Channel[int] = Channel(capacity=16)
+        ref = weakref.ref(ch)
+        await ch.send_async(123)
+        val = await ch.recv_async()
+        assert val == 123
+        del ch
+        gc.collect()
+        return ref() is None
+
+    assert asyncio.run(scenario()) is True
+
 
 def test_token_bucket_and_leaky_bucket() -> None:
     tb = TokenBucket(capacity=10, refill_rate=1000)

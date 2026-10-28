@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import gc
+import math
 import sys
 import threading
 
 import pytest
 from lockless import (
     BroadcastRing,
+    Closed,
     ConcurrentDict,
     Empty,
     LaggedError,
@@ -16,6 +18,7 @@ from lockless import (
     SkipListSet,
     drain_deferred_decrefs,
 )
+from lockless._cabi import enter_borrow, exit_borrow, lib
 
 
 class _RefPayload:
@@ -237,3 +240,132 @@ def test_concurrent_dict_multithreaded_contention() -> None:
     for k in range(num_threads * keys_per_thread):
         assert d[k] == k * 20
     d.destroy()
+
+
+def test_zero_pickle_and_extreme_float_bigint_tuple_keys() -> None:
+    import lockless._cabi as cabi_mod
+
+    assert not hasattr(cabi_mod, "pickle")
+
+    # 1. Extreme float keys (inf, -inf, nan, 1e300) and int/float equality without RangeDefect
+    d: ConcurrentDict[object, str] = ConcurrentDict()
+    d[1] = "one"
+    d[float("inf")] = "pos_inf"
+    d[float("-inf")] = "neg_inf"
+    d[1e300] = "huge_float"
+    nan_key = float("nan")
+    d[nan_key] = "nan_val"
+
+    assert d[1.0] == "one"
+    assert d[1] == "one"
+    assert d[float("inf")] == "pos_inf"
+    assert d[float("-inf")] == "neg_inf"
+    assert d[1e300] == "huge_float"
+    assert math.isnan(float("nan"))
+
+    # Overwrite 1 via 1.0
+    assert d.put(1.0, "one_float") == "one"
+    assert d[1] == "one_float"
+
+    # Big integers (> 64-bit and < -2^63) in ConcurrentDict
+    big_pos = 1 << 100
+    big_neg = -(1 << 100)
+    d[big_pos] = "big_pos"
+    d[big_neg] = "big_neg"
+    assert d[big_pos] == "big_pos"
+    assert d[big_neg] == "big_neg"
+    assert (1 << 101) not in d
+    d.destroy()
+
+    # 2. Order-preserving big integers in SkipListMap & SkipListSet
+    sm_int: SkipListMap[int, int] = SkipListMap()
+    big_keys = [
+        1 << 128,
+        -(1 << 128),
+        1 << 80,
+        -(1 << 80),
+        (1 << 80) + 1,
+        -(1 << 80) - 1,
+        0,
+        -1,
+        1,
+        (1 << 63) - 1,
+        -(1 << 63),
+    ]
+    for k in big_keys:
+        sm_int[k] = k * 2
+    assert sm_int.keys() == sorted(big_keys)
+    assert sm_int.values() == [k * 2 for k in sorted(big_keys)]
+    sm_int.destroy()
+
+    # 3. Order-preserving scalar tuples in SkipListSet
+    s_tup: SkipListSet[tuple[int, str]] = SkipListSet()
+    tuples = [
+        (10, "b"),
+        (2, "z"),
+        (-100, "a"),
+        (-2, "a"),
+        (2, "a"),
+        (1 << 80, "big"),
+        (-(1 << 80), "neg_big"),
+    ]
+    for t in tuples:
+        assert s_tup.add(t) is True
+    assert s_tup.to_list() == sorted(tuples)
+
+    # Negative control: non-comparable tuple element (None) in SkipListSet raises TypeError
+    with pytest.raises(TypeError):
+        s_tup.add((1, None))  # type: ignore[arg-type]
+    s_tup.destroy()
+
+
+def test_borrow_guard_blocks_cross_thread_deferred_decref() -> None:
+    d: ConcurrentDict[str, _RefPayload] = ConcurrentDict()
+    p1 = _RefPayload("p1", 1)
+    p2 = _RefPayload("p2", 2)
+    base1 = sys.getrefcount(p1)
+    d["k"] = p1
+
+    # Enter borrow on main thread, then displace "k" -> p2 so p1 is retired into deferred queue
+    enter_borrow()
+    try:
+        d["k"] = p2
+        assert int(lib.ll_deferred_decref_count()) >= 1
+
+        # Another thread calling drain_deferred_decrefs() while borrower is active must drain 0
+        drained_in_worker: list[int] = []
+
+        def worker() -> None:
+            drained_in_worker.append(drain_deferred_decrefs())
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert drained_in_worker == [0]
+        # p1 must still be kept alive in the deferred queue while borrow is active
+        assert sys.getrefcount(p1) == base1 + 1
+    finally:
+        exit_borrow()
+
+    drain_deferred_decrefs()
+    assert sys.getrefcount(p1) == base1
+    d.destroy()
+
+
+def test_broadcast_ring_destroy_invalidates_active_subscribers() -> None:
+    ring: BroadcastRing[int] = BroadcastRing(capacity=16)
+    sub = ring.subscribe()
+    for i in range(20):
+        ring.publish(i)
+    assert sub.poll(raise_on_lag=False) == 16
+    assert sub.lag == 16
+
+    # Destroying ring first must cleanly invalidate active subscribers
+    ring.destroy()
+    assert sub.is_closed is True
+    assert sub.lag == 0
+    with pytest.raises(Closed):
+        sub.poll()
+    # Calling unsubscribe() after ring.destroy() is a safe no-op
+    sub.unsubscribe()

@@ -7,6 +7,7 @@ import ctypes
 import os
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -81,6 +82,7 @@ class Channel(Generic[T]):
     """
 
     __slots__ = (
+        "__weakref__",
         "_async_read_waiters",
         "_async_write_waiters",
         "_capacity",
@@ -185,23 +187,38 @@ class Channel(Generic[T]):
         if not fut.done():
             fut.set_result(None)
 
+    @staticmethod
+    def _weak_pipe_readable(self_ref: weakref.ReferenceType[Channel[Any]]) -> None:
+        ch = self_ref()
+        if ch is not None:
+            ch._on_pipe_readable()
+
     def _ensure_loop_reader(self, loop: asyncio.AbstractEventLoop) -> None:
         if loop not in self._registered_loops and self._r_fd >= 0:
             try:
-                loop.add_reader(self._r_fd, self._on_pipe_readable)
+                loop.add_reader(self._r_fd, Channel._weak_pipe_readable, weakref.ref(self))
                 self._registered_loops.add(loop)
             except Exception:
                 pass
 
+    def _remove_loop_readers(self) -> None:
+        for loop in list(self._registered_loops):
+            try:
+                if not loop.is_closed() and self._r_fd >= 0:
+                    loop.remove_reader(self._r_fd)
+            except Exception:
+                pass
+        self._registered_loops.clear()
+
     def _notify_after_push(self, was_empty: bool) -> None:
         with self._lock:
-            has_waiters = (
-                was_empty or self._waiting_readers > 0 or len(self._async_read_waiters) > 0
-            )
-            if has_waiters:
+            has_sync_waiters = was_empty or self._waiting_readers > 0
+            has_async_waiters = len(self._async_read_waiters) > 0 or len(self._registered_loops) > 0
+            if has_async_waiters and (was_empty or len(self._async_read_waiters) > 0):
                 self._signal_wakeup_pipe()
+            if has_sync_waiters:
                 self._not_empty_cond.notify_all()
-        if has_waiters:
+        if has_async_waiters:
             self._wake_async_readers()
 
     def _notify_after_pop(self) -> None:
@@ -402,23 +419,19 @@ class Channel(Generic[T]):
             self._closed = True
             self._queue.close()
             with self._lock:
-                self._signal_wakeup_pipe()
+                if len(self._async_read_waiters) > 0 or len(self._registered_loops) > 0:
+                    self._signal_wakeup_pipe()
                 self._not_empty_cond.notify_all()
                 self._not_full_cond.notify_all()
             self._wake_async_readers()
             self._wake_async_writers()
+            self._remove_loop_readers()
 
     def destroy(self) -> None:
         self.close()
         if not self._destroyed:
             self._destroyed = True
-            for loop in list(self._registered_loops):
-                try:
-                    if not loop.is_closed() and self._r_fd >= 0:
-                        loop.remove_reader(self._r_fd)
-                except Exception:
-                    pass
-            self._registered_loops.clear()
+            self._remove_loop_readers()
             if self._r_fd >= 0:
                 try:
                     os.close(self._r_fd)

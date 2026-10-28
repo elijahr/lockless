@@ -4,6 +4,13 @@ All notable changes to `lockless` are documented in this file.
 
 ## [Unreleased]
 
+- Security & concurrency hardening across `liblockless_ext` and Python bindings:
+  - Removed all `pickle` usage (`import pickle`, `pickle.dumps`) from `lockless._cabi`; implemented zero-pickle order-preserving byte encoding for arbitrary-precision big integers, IEEE-754 floats, strings, bytes, and nested scalar tuples in `ConcurrentDict`, `SkipListMap`, and `SkipListSet`.
+  - Added cross-thread atomic borrower tracking (`ll_enter_borrow` / `ll_exit_borrow`) so `drain_deferred_decrefs()` never reclaims retired `PyObject*` pointers while any thread holds a borrowed pointer.
+  - Guarded `float64`-to-`int64` conversions in `LlKey` equality and hashing against `NaN`, `Inf`, `-Inf`, and out-of-range floats, and retained `PyKVBox` ownership across `reclaimNow` in `ll_skiplist_remove`.
+  - Isolated per-thread default producer/consumer handles via `threading.local()` on unbounded `MpmcQueue` and tracked open handles/subscribers via `weakref.WeakSet` on `MpmcQueue` and `BroadcastRing`.
+  - Switched `Channel` event-loop reader callbacks to weak references, removed readers on `close()`, and avoided wakeup pipe writes when no async readers are registered.
+  - Aligned rate-limiter C declarations in `include/lockless_ext.h` and validated non-negative integer `start` bounds in `TaskPool.parallel_for`.
 - Initial release of `lockless` standalone Python concurrency & DSP package backed by `lockfree` Nim C-ABI (`liblockless_ext`):
   - Wait-free and lock-free queues: `BQueue128`, `SpscQueue`, and `MpmcQueue` with `PyObject*` reference transfer and batch operations.
   - Zero-copy SPSC DSP ring buffer: `StreamBuffer` with `reserve_write(n)` and `peek_read(max_n)` context managers returning writable/read-only `memoryview` pairs `(first_view, second_view)`.

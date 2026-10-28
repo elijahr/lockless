@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+import weakref
 from typing import Any, Generic, TypeVar
 
 from ._cabi import (
@@ -344,7 +346,7 @@ class SpscQueue(Generic[T]):
 class MpmcProducer(Generic[T]):
     """Producer handle for an ``MpmcQueue``."""
 
-    __slots__ = ("_closed", "_ptr", "_queue")
+    __slots__ = ("__weakref__", "_closed", "_ptr", "_queue")
 
     def __init__(self, queue: MpmcQueue[T], ptr: Any) -> None:
         self._queue = queue
@@ -352,8 +354,8 @@ class MpmcProducer(Generic[T]):
         self._closed = False
 
     def push(self, item: T) -> None:
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("MpmcProducer is closed")
+        if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
+            raise Closed("MpmcProducer is closed or MpmcQueue is destroyed")
         raw = box_pyobj(item)
         rc = lib.lf_push(self._ptr, raw)
         if rc != LF_OK:
@@ -361,8 +363,8 @@ class MpmcProducer(Generic[T]):
             CheckStatusError.check(rc, "MpmcProducer.push")
 
     def push_ex(self, item: T) -> bool:
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("MpmcProducer is closed")
+        if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
+            raise Closed("MpmcProducer is closed or MpmcQueue is destroyed")
         raw = box_pyobj(item)
         was_empty = ffi.new("bool*")
         rc = lib.lf_push_ex(self._ptr, raw, was_empty)
@@ -372,8 +374,8 @@ class MpmcProducer(Generic[T]):
         return bool(was_empty[0])
 
     def try_push(self, item: T) -> bool:
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("MpmcProducer is closed")
+        if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
+            raise Closed("MpmcProducer is closed or MpmcQueue is destroyed")
         raw = box_pyobj(item)
         rc = lib.lf_push(self._ptr, raw)
         if rc == LF_OK:
@@ -407,7 +409,7 @@ class MpmcProducer(Generic[T]):
 class MpmcConsumer(Generic[T]):
     """Consumer handle for an ``MpmcQueue``."""
 
-    __slots__ = ("_closed", "_ptr", "_queue")
+    __slots__ = ("__weakref__", "_closed", "_ptr", "_queue")
 
     def __init__(self, queue: MpmcQueue[T], ptr: Any) -> None:
         self._queue = queue
@@ -415,8 +417,8 @@ class MpmcConsumer(Generic[T]):
         self._closed = False
 
     def pop(self) -> T:
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("MpmcConsumer is closed")
+        if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
+            raise Closed("MpmcConsumer is closed or MpmcQueue is destroyed")
         out_item = ffi.new("void**")
         rc = lib.lf_pop(self._ptr, out_item)
         if rc != LF_OK:
@@ -424,8 +426,8 @@ class MpmcConsumer(Generic[T]):
         return unbox_pyobj_steal(out_item[0])
 
     def try_pop(self, default: Any = None) -> Any:
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("MpmcConsumer is closed")
+        if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
+            raise Closed("MpmcConsumer is closed or MpmcQueue is destroyed")
         out_item = ffi.new("void**")
         rc = lib.lf_pop(self._ptr, out_item)
         if rc == LF_OK:
@@ -437,8 +439,8 @@ class MpmcConsumer(Generic[T]):
         return default
 
     def pop_batch(self, max_count: int = 64) -> list[T]:
-        if self._closed or self._ptr == ffi.NULL:
-            raise Closed("MpmcConsumer is closed")
+        if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
+            raise Closed("MpmcConsumer is closed or MpmcQueue is destroyed")
         if max_count <= 0:
             raise ValueError("max_count must be positive")
         buf = ffi.new("void*[]", max_count)
@@ -477,7 +479,18 @@ class MpmcQueue(Generic[T]):
         ``None`` / ``0`` for an unbounded Michael-Scott MPMC queue with Debra SMR.
     """
 
-    __slots__ = ("_capacity", "_default_cons", "_default_prod", "_destroyed", "_ptr")
+    __slots__ = (
+        "_capacity",
+        "_consumers",
+        "_default_cons",
+        "_default_prod",
+        "_destroyed",
+        "_producers",
+        "_ptr",
+        "_tls_cons_ptrs",
+        "_tls_handles",
+        "_tls_prod_ptrs",
+    )
 
     def __init__(self, capacity: int | None = 1024) -> None:
         out_q = ffi.new("lf_queue_t**")
@@ -504,30 +517,65 @@ class MpmcQueue(Generic[T]):
 
         self._ptr = out_q[0]
         self._destroyed = False
+        self._producers: weakref.WeakSet[MpmcProducer[T]] = weakref.WeakSet()
+        self._consumers: weakref.WeakSet[MpmcConsumer[T]] = weakref.WeakSet()
+        self._tls_handles = threading.local()
+        self._tls_prod_ptrs: list[Any] = []
+        self._tls_cons_ptrs: list[Any] = []
 
-        out_p = ffi.new("lf_producer_t**")
-        rc_p = lib.lf_producer_acquire(self._ptr, out_p)
-        if rc_p != LF_OK:
-            lib.lf_queue_destroy(self._ptr)
-            self._ptr = ffi.NULL
-            self._destroyed = True
-            CheckStatusError.check(rc_p, "MpmcQueue.producer")
-        self._default_prod = out_p[0]
+        if self._capacity is not None:
+            out_p = ffi.new("lf_producer_t**")
+            rc_p = lib.lf_producer_acquire(self._ptr, out_p)
+            if rc_p != LF_OK:
+                lib.lf_queue_destroy(self._ptr)
+                self._ptr = ffi.NULL
+                self._destroyed = True
+                CheckStatusError.check(rc_p, "MpmcQueue.producer")
+            self._default_prod = out_p[0]
 
-        out_c = ffi.new("lf_consumer_t**")
-        rc_c = lib.lf_consumer_acquire(self._ptr, out_c)
-        if rc_c != LF_OK:
-            lib.lf_producer_release(self._default_prod)
+            out_c = ffi.new("lf_consumer_t**")
+            rc_c = lib.lf_consumer_acquire(self._ptr, out_c)
+            if rc_c != LF_OK:
+                lib.lf_producer_release(self._default_prod)
+                self._default_prod = ffi.NULL
+                lib.lf_queue_destroy(self._ptr)
+                self._ptr = ffi.NULL
+                self._destroyed = True
+                CheckStatusError.check(rc_c, "MpmcQueue.consumer")
+            self._default_cons = out_c[0]
+        else:
             self._default_prod = ffi.NULL
-            lib.lf_queue_destroy(self._ptr)
-            self._ptr = ffi.NULL
-            self._destroyed = True
-            CheckStatusError.check(rc_c, "MpmcQueue.consumer")
-        self._default_cons = out_c[0]
+            self._default_cons = ffi.NULL
 
     def _check_alive(self) -> None:
         if self._destroyed or self._ptr == ffi.NULL:
             raise Closed("MpmcQueue has been destroyed")
+
+    def _get_default_prod(self) -> Any:
+        if self._capacity is not None:
+            return self._default_prod
+        p = getattr(self._tls_handles, "prod", ffi.NULL)
+        if p == ffi.NULL:
+            out_p = ffi.new("lf_producer_t**")
+            rc = lib.lf_producer_acquire(self._ptr, out_p)
+            CheckStatusError.check(rc, "MpmcQueue.producer")
+            p = out_p[0]
+            self._tls_handles.prod = p
+            self._tls_prod_ptrs.append(p)
+        return p
+
+    def _get_default_cons(self) -> Any:
+        if self._capacity is not None:
+            return self._default_cons
+        c = getattr(self._tls_handles, "cons", ffi.NULL)
+        if c == ffi.NULL:
+            out_c = ffi.new("lf_consumer_t**")
+            rc = lib.lf_consumer_acquire(self._ptr, out_c)
+            CheckStatusError.check(rc, "MpmcQueue.consumer")
+            c = out_c[0]
+            self._tls_handles.cons = c
+            self._tls_cons_ptrs.append(c)
+        return c
 
     @property
     def capacity(self) -> int | None:
@@ -561,7 +609,9 @@ class MpmcQueue(Generic[T]):
         out_p = ffi.new("lf_producer_t**")
         rc = lib.lf_producer_acquire(self._ptr, out_p)
         CheckStatusError.check(rc, "MpmcQueue.producer")
-        return MpmcProducer(self, out_p[0])
+        prod = MpmcProducer(self, out_p[0])
+        self._producers.add(prod)
+        return prod
 
     def consumer(self) -> MpmcConsumer[T]:
         """Creates an independent consumer handle for this queue."""
@@ -569,13 +619,16 @@ class MpmcQueue(Generic[T]):
         out_c = ffi.new("lf_consumer_t**")
         rc = lib.lf_consumer_acquire(self._ptr, out_c)
         CheckStatusError.check(rc, "MpmcQueue.consumer")
-        return MpmcConsumer(self, out_c[0])
+        cons = MpmcConsumer(self, out_c[0])
+        self._consumers.add(cons)
+        return cons
 
     def push(self, item: T) -> None:
         """Enqueues ``item`` without blocking, raising ``Full`` or ``Closed``."""
         self._check_alive()
+        prod = self._get_default_prod()
         raw = box_pyobj(item)
-        rc = lib.lf_push(self._default_prod, raw)
+        rc = lib.lf_push(prod, raw)
         if rc != LF_OK:
             decref_pyobj_ptr(raw)
             CheckStatusError.check(rc, "MpmcQueue.push")
@@ -583,9 +636,10 @@ class MpmcQueue(Generic[T]):
     def push_ex(self, item: T) -> bool:
         """Enqueues ``item`` and returns ``True`` if the queue transitioned from 0 to 1 item."""
         self._check_alive()
+        prod = self._get_default_prod()
         raw = box_pyobj(item)
         was_empty = ffi.new("bool*")
-        rc = lib.lf_push_ex(self._default_prod, raw, was_empty)
+        rc = lib.lf_push_ex(prod, raw, was_empty)
         if rc != LF_OK:
             decref_pyobj_ptr(raw)
             CheckStatusError.check(rc, "MpmcQueue.push_ex")
@@ -594,8 +648,9 @@ class MpmcQueue(Generic[T]):
     def try_push(self, item: T) -> bool:
         """Attempts to enqueue ``item``, returning ``False`` if full."""
         self._check_alive()
+        prod = self._get_default_prod()
         raw = box_pyobj(item)
-        rc = lib.lf_push(self._default_prod, raw)
+        rc = lib.lf_push(prod, raw)
         if rc == LF_OK:
             return True
         decref_pyobj_ptr(raw)
@@ -609,8 +664,9 @@ class MpmcQueue(Generic[T]):
     def pop(self) -> T:
         """Dequeues and returns an item, raising ``Empty`` or ``Closed``."""
         self._check_alive()
+        cons = self._get_default_cons()
         out_item = ffi.new("void**")
-        rc = lib.lf_pop(self._default_cons, out_item)
+        rc = lib.lf_pop(cons, out_item)
         if rc != LF_OK:
             CheckStatusError.check(rc, "MpmcQueue.pop")
         return unbox_pyobj_steal(out_item[0])
@@ -620,8 +676,9 @@ class MpmcQueue(Generic[T]):
     def try_pop(self, default: Any = None) -> Any:
         """Dequeues and returns an item, or ``default`` if empty."""
         self._check_alive()
+        cons = self._get_default_cons()
         out_item = ffi.new("void**")
-        rc = lib.lf_pop(self._default_cons, out_item)
+        rc = lib.lf_pop(cons, out_item)
         if rc == LF_OK:
             return unbox_pyobj_steal(out_item[0])
         if rc in (LF_ERR_EMPTY, LF_ERR_CLOSED):
@@ -635,8 +692,9 @@ class MpmcQueue(Generic[T]):
         self._check_alive()
         if max_count <= 0:
             raise ValueError("max_count must be positive")
+        cons = self._get_default_cons()
         buf = ffi.new("void*[]", max_count)
-        n = int(lib.lf_pop_batch(self._default_cons, buf, max_count))
+        n = int(lib.lf_pop_batch(cons, buf, max_count))
         result: list[T] = [unbox_pyobj_steal(buf[i]) for i in range(n)]
         drain_deferred_decrefs()
         return result
@@ -644,8 +702,9 @@ class MpmcQueue(Generic[T]):
     def clear(self) -> None:
         """Drains all items currently in the queue and releases their Python reference counts."""
         self._check_alive()
+        cons = self._get_default_cons()
         out_item = ffi.new("void**")
-        while lib.lf_pop(self._default_cons, out_item) == LF_OK:
+        while lib.lf_pop(cons, out_item) == LF_OK:
             unbox_pyobj_steal(out_item[0])
         drain_deferred_decrefs()
 
@@ -656,15 +715,29 @@ class MpmcQueue(Generic[T]):
             drain_deferred_decrefs()
 
     def destroy(self) -> None:
-        """Closes default handles and destroys the underlying C-ABI queue."""
+        """Closes all open handles and destroys the underlying C-ABI queue."""
         if not self._destroyed and self._ptr != ffi.NULL:
-            self._destroyed = True
+            for prod in list(self._producers):
+                prod.close()
+            self._producers.clear()
+            for cons in list(self._consumers):
+                cons.close()
+            self._consumers.clear()
+            for p_ptr in self._tls_prod_ptrs:
+                if p_ptr != ffi.NULL:
+                    lib.lf_producer_release(p_ptr)
+            self._tls_prod_ptrs.clear()
+            for c_ptr in self._tls_cons_ptrs:
+                if c_ptr != ffi.NULL:
+                    lib.lf_consumer_release(c_ptr)
+            self._tls_cons_ptrs.clear()
             if self._default_prod != ffi.NULL:
                 lib.lf_producer_release(self._default_prod)
                 self._default_prod = ffi.NULL
             if self._default_cons != ffi.NULL:
                 lib.lf_consumer_release(self._default_cons)
                 self._default_cons = ffi.NULL
+            self._destroyed = True
             ptr = self._ptr
             self._ptr = ffi.NULL
             lib.lf_queue_destroy(ptr)
