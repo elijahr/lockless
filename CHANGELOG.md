@@ -4,6 +4,7 @@ All notable changes to `lockless` are documented in this file.
 
 ## [Unreleased]
 
+- Updated `lockless.nimble` dependencies to `requires "lockfree >= 0.6.6 & < 0.7.0"` and `requires "typestates >= 0.14.0 & < 0.15.0"`.
 - Security & concurrency hardening across `liblockless_ext` and Python bindings:
   - Removed all `pickle` usage (`import pickle`, `pickle.dumps`) from `lockless._cabi`; implemented zero-pickle order-preserving byte encoding for arbitrary-precision big integers, IEEE-754 floats, strings, bytes, and nested scalar tuples in `ConcurrentDict`, `SkipListMap`, and `SkipListSet`.
   - Added cross-thread atomic borrower tracking (`ll_enter_borrow` / `ll_exit_borrow`) so `drain_deferred_decrefs()` never reclaims retired `PyObject*` pointers while any thread holds a borrowed pointer.
