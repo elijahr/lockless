@@ -15,6 +15,23 @@ from cffi import FFI
 
 from ._cdef_generated import CDEF
 
+_PKG_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _PKG_DIR.parent.parent
+for _naganim_cand in (
+    _REPO_ROOT.parent / "naganim" / "python",
+    _REPO_ROOT.parent.parent.parent / "naganim" / "python",
+    _REPO_ROOT.parent.parent.parent.parent / "naganim" / "python",
+):
+    if (_naganim_cand / "naganim" / "__init__.py").exists() and str(_naganim_cand) not in sys.path:
+        sys.path.insert(0, str(_naganim_cand))
+
+try:
+    from naganim._cffi_loader import NaganimRuntimeError
+except ImportError:
+
+    class NaganimRuntimeError(RuntimeError):  # type: ignore[no-redef]
+        """Fallback runtime error when naganim Python package is not installed."""
+
 # ==============================================================================
 # Exception Hierarchy
 # ==============================================================================
@@ -100,6 +117,12 @@ def _resolve_library_path() -> Path:
     import subprocess
 
     pkg_dir = Path(__file__).resolve().parent
+    repo_root = pkg_dir.parent.parent
+    nim_src = repo_root / "src" / "lockless_ext.nim"
+    header_src = repo_root / "include" / "lockless_ext.h"
+    src_mtimes = [p.stat().st_mtime for p in (nim_src, header_src) if p.exists()]
+    latest_src_mtime = max(src_mtimes) if src_mtimes else 0.0
+
     candidates = [
         pkg_dir / "liblockless_ext.dylib",
         pkg_dir / "liblockless_ext.so",
@@ -107,10 +130,10 @@ def _resolve_library_path() -> Path:
     ]
     for path in candidates:
         if path.exists():
+            if latest_src_mtime > 0.0 and nim_src.exists() and path.stat().st_mtime < latest_src_mtime:
+                break
             return path
 
-    repo_root = pkg_dir.parent.parent
-    nim_src = repo_root / "src" / "lockless_ext.nim"
     if nim_src.exists():
         ext = (
             ".dylib" if sys.platform == "darwin" else (".dll" if sys.platform == "win32" else ".so")
@@ -204,7 +227,8 @@ def _load_library() -> tuple[Any, ctypes.CDLL]:
 
 
 lib, cdll = _load_library()
-lib.naganim_init_runtime()
+if int(lib.naganim_init_runtime()) != 0:
+    raise NaganimRuntimeError("naganim_init_runtime() failed while initializing lockless")
 
 # ==============================================================================
 # CPython PyObject* Reference Accounting & Wait-Free Deferred DecRef Drain

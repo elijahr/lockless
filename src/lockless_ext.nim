@@ -34,7 +34,6 @@
 ## ==============================================================================
 
 import std/[hashes, options]
-from std/atomics as std_atomics import nil
 import naganim/[abi, lifecycle, gc_bridge]
 export lifecycle, gc_bridge
 import lockfree/atomics as lf_atomics
@@ -58,68 +57,27 @@ export cabi
 # 1. Wait-Free Deferred Py_DecRef Queue (Delegated to naganim/gc_bridge)
 # ==============================================================================
 
-var
-  gActiveBorrowers {.global, align: CacheLineBytes.}: lf_atomics.Atomic[int]
-
 proc ll_enter_borrow*() {.exportc: "ll_enter_borrow", cdecl, gcsafe, raises: [].} =
-  discard gActiveBorrowers.fetchAdd(1, moAcquireRelease)
+  discard naganim_enter_borrow()
 
 proc ll_exit_borrow*() {.exportc: "ll_exit_borrow", cdecl, gcsafe, raises: [].} =
-  discard gActiveBorrowers.fetchSub(1, moAcquireRelease)
+  discard naganim_exit_borrow()
 
 proc ll_retire_pyobj*(pyobj: pointer) {.exportc: "ll_retire_pyobj", cdecl, gcsafe, raises: [].} =
-  if unlikely(pyobj == nil):
-    return
-  enqueueDeferredDecRef(cast[PyObjectPtr](pyobj))
+  discard naganim_retire_pyobj(pyobj)
 
 proc ll_pop_deferred_decref*(out_pyobj: ptr pointer): bool {.
     exportc: "ll_pop_deferred_decref", cdecl, gcsafe, raises: [].} =
-  if unlikely(out_pyobj == nil):
-    return false
-  if gActiveBorrowers.load(moAcquire) > 0:
-    out_pyobj[] = nil
-    return false
-  if deferredDecRefPendingCount() <= 0:
-    out_pyobj[] = nil
-    return false
-  ensureDeferredQueueInitialized()
-  if likely(gDeferredDecRefQueuePtr != nil):
-    var item: pointer = nil
-    {.cast(gcsafe), cast(raises: []).}:
-      if gDeferredDecRefQueuePtr[].tryPop(item):
-        discard std_atomics.fetchSub(gDeferredPendingCount, 1, std_atomics.moAcquireRelease)
-        out_pyobj[] = item
-        return true
-  {.cast(gcsafe), cast(raises: []).}:
-    try:
-      let opt = gOverflowDecRefStack.pop()
-      if opt.isSome:
-        discard std_atomics.fetchSub(gDeferredPendingCount, 1, std_atomics.moAcquireRelease)
-        out_pyobj[] = opt.get
-        return true
-    except CatchableError, Defect:
-      discard
-  out_pyobj[] = nil
-  return false
+  naganim_pop_deferred_decref(out_pyobj) != 0
 
 proc ll_pop_deferred_decref_batch*(
     out_pyobjs: ptr pointer, max_count: csize_t
 ): csize_t {.exportc: "ll_pop_deferred_decref_batch", cdecl, gcsafe, raises: [].} =
-  if unlikely(out_pyobjs == nil or max_count == 0):
-    return 0
-  if gActiveBorrowers.load(moAcquire) > 0:
-    return 0
-  let arr = cast[ptr UncheckedArray[pointer]](out_pyobjs)
-  var count: csize_t = 0
-  var item: pointer = nil
-  while count < max_count and ll_pop_deferred_decref(addr item):
-    arr[int(count)] = item
-    inc count
-  return count
+  naganim_pop_deferred_decref_batch(out_pyobjs, max_count)
 
 proc ll_deferred_decref_count*(): csize_t {.
     exportc: "ll_deferred_decref_count", cdecl, gcsafe, raises: [].} =
-  let c = deferredDecRefPendingCount()
+  let c = naganim_deferred_decref_count()
   if c <= 0: 0.csize_t else: csize_t(c)
 
 # ==============================================================================
@@ -824,6 +782,7 @@ proc hash(k: LlKey): Hash {.inline.} =
 type
   PyKVHolder = object
     rc: Atomic[int]
+    retired: Atomic[bool]
     keyObj: pointer
     valObj: pointer
 
@@ -833,19 +792,25 @@ type
 proc allocPyKVBox(keyObj: pointer, valObj: pointer): PyKVBox {.inline, gcsafe, raises: [].} =
   let h = cast[ptr PyKVHolder](allocShared0(sizeof(PyKVHolder)))
   h.rc.store(1, moRelaxed)
+  h.retired.store(false, moRelaxed)
   h.keyObj = keyObj
   h.valObj = valObj
   result.holder = h
 
+proc retirePyKVHolderOnce(h: ptr PyKVHolder) {.inline, gcsafe, raises: [].} =
+  if h != nil:
+    if not h.retired.exchange(true, moAcquireRelease):
+      if h.keyObj != nil:
+        ll_retire_pyobj(h.keyObj)
+      if h.valObj != nil:
+        ll_retire_pyobj(h.valObj)
+
 proc `=destroy`(x: var PyKVBox) {.gcsafe, raises: [].} =
   if x.holder != nil:
     if x.holder.rc.fetchSub(1, moAcquireRelease) == 1:
-      if x.holder.keyObj != nil:
-        ll_retire_pyobj(x.holder.keyObj)
-        x.holder.keyObj = nil
-      if x.holder.valObj != nil:
-        ll_retire_pyobj(x.holder.valObj)
-        x.holder.valObj = nil
+      retirePyKVHolderOnce(x.holder)
+      x.holder.keyObj = nil
+      x.holder.valObj = nil
       deallocShared(x.holder)
     x.holder = nil
 
@@ -877,30 +842,16 @@ proc hasActiveDebraPin[MaxThreads: static int, CC: static PinScopeCardinality](
 proc trySafeReclaim[MaxThreads: static int, CC: static PinScopeCardinality](
     th: ThreadHandle[MaxThreads, CC]
 ) {.inline, gcsafe, raises: [].} =
-  ## Reclaims retired DEBRA+ nodes on the calling thread. Only advances
-  ## `globalEpoch` when no DEBRA+ readers (`hasActiveDebraPin`) are pinned in
-  ## flight; if any concurrent reader is pinned, runs a non-forced `reclaimNow`
-  ## respecting all pinned threads' epochs. Retired `PyObject*` pointers are
-  ## enqueued to the naganim deferred decref queue, which remains gated by
-  ## `gActiveBorrowers` until all active borrows exit.
+  ## Runs a single non-forced DEBRA+ reclamation pass over the calling thread's
+  ## retired limbo bags without artificially bumping `globalEpoch` during live
+  ## operations.
   if th.manager == nil:
     return
-  if hasActiveDebraPin(th.manager):
-    {.cast(gcsafe).}:
-      try:
-        discard reclaimNow(th)
-      except CatchableError, Defect:
-        discard
-    return
-  for _ in 0 .. 3:
-    if hasActiveDebraPin(th.manager):
-      break
-    discard th.manager.globalEpoch.fetchAdd(1'u64, moRelease)
-    {.cast(gcsafe).}:
-      try:
-        discard reclaimNow(th)
-      except CatchableError, Defect:
-        discard
+  {.cast(gcsafe).}:
+    try:
+      discard reclaimNow(th)
+    except CatchableError, Defect:
+      discard
 
 type
   ll_ctrie_t* {.exportc: "ll_ctrie_t".} = object
@@ -968,6 +919,7 @@ proc ll_ctrie_put*(
       if out_old_val_pyobj != nil:
         out_old_val_pyobj[] = if prev.get.holder != nil: prev.get.holder.valObj else: nil
       if ctrie.raw.core != nil and ctrie.raw.core.rc.load(moAcquire) <= 1:
+        retirePyKVHolderOnce(prev.get.holder)
         let th = ctrie.raw[].getOrRegisterHandle()
         trySafeReclaim(th)
     else:
@@ -1049,6 +1001,7 @@ proc ll_ctrie_remove*(
       if out_val_pyobj != nil:
         out_val_pyobj[] = valPtr
       if ctrie.raw.core != nil and ctrie.raw.core.rc.load(moAcquire) <= 1:
+        retirePyKVHolderOnce(opt.get.holder)
         let th = ctrie.raw[].getOrRegisterHandle()
         trySafeReclaim(th)
       return LF_OK
@@ -1243,11 +1196,14 @@ proc ll_skiplist_put*(
   {.cast(gcsafe).}:
     try:
       let k = makeLlKey(key_kind, key_int, key_float, key_bytes, key_len)
+      var prevOpt = map.raw[].get(k)
       let box = allocPyKVBox(key_pyobj, val_pyobj)
       let inserted = map.raw[].put(k, box)
       if out_inserted != nil:
         out_inserted[] = inserted
       if not inserted:
+        if prevOpt.isSome:
+          retirePyKVHolderOnce(prevOpt.get.holder)
         let th = map.raw[].getOrRegisterHandle()
         trySafeReclaim(th)
       return LF_OK
@@ -1326,6 +1282,8 @@ proc ll_skiplist_remove*(
       if map.raw[].delete(k):
         if out_val_pyobj != nil:
           out_val_pyobj[] = if opt.isSome and opt.get.holder != nil: opt.get.holder.valObj else: nil
+        if opt.isSome:
+          retirePyKVHolderOnce(opt.get.holder)
         let th = map.raw[].getOrRegisterHandle()
         trySafeReclaim(th)
         return LF_OK
@@ -1556,6 +1514,12 @@ proc ll_keepalive_cabi*(): int {.exportc: "ll_keepalive_cabi", cdecl, gcsafe, ra
     cast[pointer](naganim_shutdown_runtime),
     cast[pointer](naganim_flush_deferred_decrefs),
     cast[pointer](naganim_deferred_decref_count),
+    cast[pointer](naganim_enter_borrow),
+    cast[pointer](naganim_exit_borrow),
+    cast[pointer](naganim_active_borrowers),
+    cast[pointer](naganim_retire_pyobj),
+    cast[pointer](naganim_pop_deferred_decref),
+    cast[pointer](naganim_pop_deferred_decref_batch),
     cast[pointer](ll_enter_borrow),
     cast[pointer](ll_exit_borrow),
     cast[pointer](ll_register_py_compare),

@@ -70,9 +70,11 @@ ignore = ["E501", "SIM105"]
 [tool.mypy]
 python_version = "3.10"
 strict = true
-mypy_path = ["python", "../headerkit", "../naganim/python", "../../../../headerkit", "../../../../naganim/python"]
+mypy_path = ["python"]
 
 [[tool.mypy.overrides]]
-module = ["cffi", "cffi.*", "headerkit", "headerkit.*"]
+module = ["cffi", "cffi.*", "headerkit", "headerkit.*", "naganim", "naganim.*"]
 ignore_missing_imports = true
+follow_imports = "silent"
+
 

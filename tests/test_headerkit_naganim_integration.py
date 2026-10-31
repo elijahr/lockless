@@ -83,14 +83,17 @@ def test_naganim_deferred_decref_bridge_and_borrow_guard() -> None:
     assert int(cabi.lib.ll_deferred_decref_count()) == 1
 
     # Negative control: while a borrow guard is active, drain_deferred_decrefs must not drain
+    assert int(cabi.lib.naganim_active_borrowers()) == 0
     cabi.enter_borrow()
     try:
+        assert int(cabi.lib.naganim_active_borrowers()) == 1
         drained_during_borrow = lockless.drain_deferred_decrefs()
         assert drained_during_borrow == 0
         assert int(cabi.lib.naganim_deferred_decref_count()) == 1
         assert sys.getrefcount(payload) == base_rc + 1
     finally:
         cabi.exit_borrow()
+    assert int(cabi.lib.naganim_active_borrowers()) == 0
 
     # Exiting the outermost borrow automatically drains the deferred decref queue
     assert int(cabi.lib.naganim_deferred_decref_count()) == 0

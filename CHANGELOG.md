@@ -4,6 +4,7 @@ All notable changes to `lockless` are documented in this file.
 
 ## [Unreleased]
 
+- Unified `ll_enter_borrow` / `ll_exit_borrow` / `ll_pop_deferred_decref*` with `naganim/gc_bridge` (`naganim_enter_borrow`, `naganim_exit_borrow`, `naganim_active_borrowers`, `naganim_pop_deferred_decref_batch`), added automatic stale shared-library `st_mtime` rebuild detection in `python/lockless/_cabi.py`, removed forced `globalEpoch.fetchAdd` loops from live `trySafeReclaim` calls in `src/lockless_ext.nim` via idempotent `retirePyKVHolderOnce`, and scoped `[tool.mypy]` `mypy_path` to `["python"]` with `follow_imports = "silent"` for external sibling packages.
 - Integrated `naganim` (`naganim/abi`, `naganim/gc_bridge`, `naganim/lifecycle`) and `headerkit` (`python/lockless/_codegen.py`, `python/lockless/_cdef_generated.py`, `python/lockless/_cdef_generated.pyi`) into `lockless`, removing the duplicated deferred-decref queue in `src/lockless_ext.nim`, the 211-line hand-written `ffi.cdef` string in `python/lockless/_cabi.py`, and the 3 redundant `ctypes.CDLL` handles across `channels.py`, `ratelimit.py`, and `taskpool.py`.
 - Remediated concurrency, SMR, and fast-path findings (`LL-CRIT-01`, `LL-CRIT-02`, `LL-CRIT-03`, `LL-CRIT-05`, `LL-CRIT-06`, `LL-HIGH-07`, `LL-HIGH-08`):
   - Fixed `BroadcastRing` `retiredBox` reclamation in `src/lockless_ext.nim` so retired `VBox[PyBroadcastBox]` nodes are never leaked when `inUse` is set by an active subscriber.
