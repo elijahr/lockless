@@ -4,6 +4,14 @@ All notable changes to `lockless` are documented in this file.
 
 ## [Unreleased]
 
+- Integrated `naganim` (`naganim/abi`, `naganim/gc_bridge`, `naganim/lifecycle`) and `headerkit` (`python/lockless/_codegen.py`, `python/lockless/_cdef_generated.py`, `python/lockless/_cdef_generated.pyi`) into `lockless`, removing the duplicated deferred-decref queue in `src/lockless_ext.nim`, the 211-line hand-written `ffi.cdef` string in `python/lockless/_cabi.py`, and the 3 redundant `ctypes.CDLL` handles across `channels.py`, `ratelimit.py`, and `taskpool.py`.
+- Remediated concurrency, SMR, and fast-path findings (`LL-CRIT-01`, `LL-CRIT-02`, `LL-CRIT-03`, `LL-CRIT-05`, `LL-CRIT-06`, `LL-HIGH-07`, `LL-HIGH-08`):
+  - Fixed `BroadcastRing` `retiredBox` reclamation in `src/lockless_ext.nim` so retired `VBox[PyBroadcastBox]` nodes are never leaked when `inUse` is set by an active subscriber.
+  - Guarded DEBRA+ reclamation (`trySafeReclaim`) in `ll_ctrie_put`, `ll_ctrie_remove`, `ll_ctrie_snapshot_destroy`, `ll_skiplist_put`, and `ll_skiplist_remove` with `hasActiveDebraPin` so `globalEpoch` is never force-advanced while concurrent readers are pinned.
+  - Fixed `spscPushEx`, `spscLen`, and `spscPeek` in `src/lockless_ext.nim` to use `BQueue`'s `2 * (N + 1)` virtual index space without a TOCTOU gap on `outWasEmpty`, and exposed `SpscQueue.push_ex(item) -> bool` in `queues.py` and `__init__.pyi`.
+  - Eliminated mutex acquisitions on the uncontended `Channel` fast path (`_notify_after_push` and `_notify_after_pop` when 0 sync/async waiters are present) and added a dedicated high-capacity executor and 250ms timeout slices to `RendezvousChannel` to prevent threadpool starvation and short-slice livelock.
+  - Fixed `TaskPool.parallel_for` 2-argument callbacks `fn(chunk_start, chunk_stop)` to dispatch true `[chunk_start, chunk_stop)` chunk ranges rather than single-element `(idx, idx + 1)` slices.
+  - Guarded `StreamBuffer.reserve_write` and `StreamBuffer.peek_read` against overlapping active write/read reservations by raising `BufferError`.
 - Updated `lockless.nimble` dependencies to `requires "lockfree >= 0.6.6 & < 0.7.0"` and `requires "typestates >= 0.14.0 & < 0.15.0"`.
 - Security & concurrency hardening across `liblockless_ext` and Python bindings:
   - Removed all `pickle` usage (`import pickle`, `pickle.dumps`) from `lockless._cabi`; implemented zero-pickle order-preserving byte encoding for arbitrary-precision big integers, IEEE-754 floats, strings, bytes, and nested scalar tuples in `ConcurrentDict`, `SkipListMap`, and `SkipListSet`.

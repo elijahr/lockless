@@ -1,4 +1,5 @@
 .vine.json
+.envrc
 .rhizo.*
 *.lock
 workspaces/
@@ -18,3 +19,4 @@ nimcache/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.headerkit/

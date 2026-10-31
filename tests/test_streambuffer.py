@@ -120,3 +120,36 @@ def test_streambuffer_negative_controls() -> None:
     assert sb.is_closed is True
     with pytest.raises(Closed):
         sb.write(b"abc")
+
+
+def test_streambuffer_overlapping_reservations_rejected() -> None:
+    sb = StreamBuffer(32)
+
+    # Overlapping reserve_write while uncommitted write reservation is active must raise BufferError
+    w_res = sb.reserve_write(8)
+    with pytest.raises(BufferError, match="uncommitted write reservation"):
+        sb.reserve_write(4)
+    w_res.first[:] = b"ABCDEFGH"
+    assert w_res.commit(8) == 8
+    assert sb.available_read == 8
+
+    # After committing, a subsequent reserve_write succeeds
+    w_res2 = sb.reserve_write(4)
+    w_res2.first[:] = b"IJKL"
+    assert w_res2.commit(4) == 4
+    assert sb.available_read == 12
+
+    # Overlapping peek_read while unconsumed read reservation is active must raise BufferError
+    r_res = sb.peek_read(6)
+    with pytest.raises(BufferError, match="unconsumed read reservation"):
+        sb.peek_read(6)
+    assert bytes(r_res.first) + bytes(r_res.second) == b"ABCDEF"
+    assert r_res.consume(6) == 6
+    assert sb.available_read == 6
+
+    # After consuming, a subsequent peek_read succeeds and sees the remaining bytes
+    r_res2 = sb.peek_read()
+    assert bytes(r_res2.first) + bytes(r_res2.second) == b"GHIJKL"
+    assert r_res2.consume(6) == 6
+    assert sb.available_read == 0
+    sb.destroy()

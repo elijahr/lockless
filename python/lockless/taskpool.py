@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import ctypes
 import inspect
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future
-from pathlib import Path
 from typing import Any, TypeVar
 
 from ._cabi import (
     LF_OK,
     CheckStatusError,
     Closed,
+    cdll,
     drain_deferred_decrefs,
     ffi,
     lib,
@@ -22,41 +21,15 @@ from ._cabi import (
 T = TypeVar("T")
 R = TypeVar("R")
 
-
-def _load_cdll() -> ctypes.CDLL:
-    pkg_dir = Path(__file__).resolve().parent
-    for name in ("liblockless_ext.dylib", "liblockless_ext.so", "lockless_ext.dll"):
-        p = pkg_dir / name
-        if p.exists():
-            cdll = ctypes.CDLL(str(p))
-            cdll.lf_taskpool_sync.argtypes = [ctypes.c_void_p]
-            cdll.lf_taskpool_sync.restype = ctypes.c_int32
-            cdll.lf_taskpool_destroy.argtypes = [ctypes.c_void_p]
-            cdll.lf_taskpool_destroy.restype = ctypes.c_int32
-            cdll.lf_taskpool_parallel_for.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-                ctypes.c_size_t,
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_size_t,
-            ]
-            cdll.lf_taskpool_parallel_for.restype = ctypes.c_int32
-            return cdll
-    raise RuntimeError(f"Could not load CDLL from {pkg_dir}")
-
-
-_cdll = _load_cdll()
-
 _TASKS_LOCK = threading.Lock()
 _NEXT_TASK_ID = 1
 _PENDING_TASKS: dict[
     int, tuple[Future[Any], Callable[..., Any], tuple[Any, ...], dict[str, Any]]
 ] = {}
-_FOR_TASKS: dict[int, tuple[Callable[..., Any], int, list[BaseException]]] = {}
+_FOR_TASKS: dict[int, tuple[Callable[..., Any], int, list[BaseException], int, int, int]] = {}
 
 
-@ffi.callback("void(void*)")
+@ffi.callback("void(void*)")  # type: ignore[untyped-decorator]
 def _task_trampoline(arg: Any) -> None:
     task_id = int(ffi.cast("uintptr_t", arg))
     with _TASKS_LOCK:
@@ -74,20 +47,23 @@ def _task_trampoline(arg: Any) -> None:
         fut.set_result(res)
 
 
-@ffi.callback("void(size_t, void*)")
+@ffi.callback("void(size_t, void*)")  # type: ignore[untyped-decorator]
 def _for_trampoline(index: int, arg: Any) -> None:
     for_id = int(ffi.cast("uintptr_t", arg))
     with _TASKS_LOCK:
         entry = _FOR_TASKS.get(for_id)
     if entry is None:
         return
-    fn, arity, errors = entry
+    fn, arity, errors, base_start, base_stop, eff_chunk = entry
     if errors:
         return
     try:
         idx = int(index)
         if arity == 2:
-            fn(idx, idx + 1)
+            c_start = base_start + idx * eff_chunk
+            c_stop = min(base_stop, c_start + eff_chunk)
+            if c_start < base_stop:
+                fn(c_start, c_stop)
         else:
             fn(idx)
     except BaseException as exc:
@@ -205,22 +181,37 @@ class TaskPool:
         except (ValueError, TypeError):
             arity = 1
 
+        if arity == 2:
+            workers = max(1, self.num_workers)
+            eff_chunk = (
+                chunk_size if chunk_size > 0 else max(1, (stop - start + workers - 1) // workers)
+            )
+            num_chunks = (stop - start + eff_chunk - 1) // eff_chunk
+            c_start_idx = 0
+            c_stop_idx = num_chunks - 1
+            c_chunk_size = 1
+        else:
+            eff_chunk = max(1, chunk_size)
+            c_start_idx = start
+            c_stop_idx = stop - 1
+            c_chunk_size = chunk_size
+
         global _NEXT_TASK_ID
         errors: list[BaseException] = []
         with _TASKS_LOCK:
             for_id = _NEXT_TASK_ID
             _NEXT_TASK_ID += 1
-            _FOR_TASKS[for_id] = (fn, arity, errors)
+            _FOR_TASKS[for_id] = (fn, arity, errors, start, stop, eff_chunk)
 
         pool_addr = int(ffi.cast("uintptr_t", self._ptr))
         try:
-            rc = _cdll.lf_taskpool_parallel_for(
+            rc = cdll.lf_taskpool_parallel_for(
                 pool_addr,
-                start,
-                stop - 1,
+                c_start_idx,
+                c_stop_idx,
                 _FOR_TRAMPOLINE_ADDR,
                 for_id,
-                chunk_size,
+                c_chunk_size,
             )
         finally:
             with _TASKS_LOCK:
@@ -234,7 +225,7 @@ class TaskPool:
         """Blocks (releasing the GIL) until all currently spawned tasks have completed."""
         self._check_alive()
         pool_addr = int(ffi.cast("uintptr_t", self._ptr))
-        rc = _cdll.lf_taskpool_sync(pool_addr)
+        rc = cdll.lf_taskpool_sync(pool_addr)
         drain_deferred_decrefs()
         CheckStatusError.check(rc, "TaskPool.sync")
 
@@ -243,10 +234,10 @@ class TaskPool:
         if not self._destroyed and self._ptr != ffi.NULL:
             pool_addr = int(ffi.cast("uintptr_t", self._ptr))
             if wait:
-                _cdll.lf_taskpool_sync(pool_addr)
+                cdll.lf_taskpool_sync(pool_addr)
             self._ptr = ffi.NULL
             self._destroyed = True
-            _cdll.lf_taskpool_destroy(pool_addr)
+            cdll.lf_taskpool_destroy(pool_addr)
             drain_deferred_decrefs()
 
     close = shutdown

@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 import weakref
 from collections.abc import Callable, Iterator
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from ._cabi import (
     LF_ERR_EMPTY,
@@ -107,7 +107,7 @@ class Subscriber(Generic[T]):
                             raise LaggedError(skipped)
                         continue
                     if kind == LF_POLL_SUCCESS:
-                        return unbox_pyobj_borrow(out_item[0])
+                        return cast(T, unbox_pyobj_borrow(out_item[0]))
                 CheckStatusError.check(rc, "Subscriber.poll")
             finally:
                 exit_borrow()
@@ -343,7 +343,7 @@ class ConcurrentDictSnapshot(Generic[K, V]):
         val = self.get(key, _MISSING)
         if val is _MISSING:
             raise KeyError(key)
-        return val
+        return cast(V, val)
 
     def __contains__(self, key: object) -> bool:
         try:
@@ -451,7 +451,7 @@ class ConcurrentDict(Generic[K, V]):
                 decref_pyobj_ptr(v_ptr)
                 CheckStatusError.check(rc, "ConcurrentDict.put")
             if bool(out_replaced[0]):
-                return unbox_pyobj_borrow(out_old[0])
+                return cast(V, unbox_pyobj_borrow(out_old[0]))
             return None
         finally:
             exit_borrow()
@@ -474,7 +474,7 @@ class ConcurrentDict(Generic[K, V]):
                 decref_pyobj_ptr(k_ptr)
                 decref_pyobj_ptr(v_ptr)
                 CheckStatusError.check(rc, "ConcurrentDict.put_if_absent")
-            return unbox_pyobj_borrow(out_existing[0])
+            return cast(V, unbox_pyobj_borrow(out_existing[0]))
         finally:
             exit_borrow()
 
@@ -485,7 +485,7 @@ class ConcurrentDict(Generic[K, V]):
         """Returns existing value for ``key`` or computes and atomically inserts ``factory(key)``."""
         existing = self.get(key, _MISSING)
         if existing is not _MISSING:
-            return existing
+            return cast(V, existing)
         computed = factory(key)
         return self.put_if_absent(key, computed)
 
@@ -516,7 +516,7 @@ class ConcurrentDict(Generic[K, V]):
         try:
             rc = lib.ll_ctrie_remove(self._ptr, kind, iv, fv, c_bytes, len(bv), out_val)
             if rc == LF_OK:
-                return unbox_pyobj_borrow(out_val[0])
+                return cast(V, unbox_pyobj_borrow(out_val[0]))
             if rc == LF_ERR_EMPTY:
                 raise KeyError(key)
             CheckStatusError.check(rc, "ConcurrentDict.remove")
@@ -538,7 +538,7 @@ class ConcurrentDict(Generic[K, V]):
         val = self.get(key, _MISSING)
         if val is _MISSING:
             raise KeyError(key)
-        return val
+        return cast(V, val)
 
     def __setitem__(self, key: K, value: V) -> None:
         self._check_alive()
@@ -546,27 +546,32 @@ class ConcurrentDict(Generic[K, V]):
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         k_ptr = box_pyobj(key)
         v_ptr = box_pyobj(value)
-        rc = lib.ll_ctrie_put(
-            self._ptr, kind, iv, fv, c_bytes, len(bv), k_ptr, v_ptr, ffi.NULL, ffi.NULL
-        )
-        if rc != LF_OK:
-            decref_pyobj_ptr(k_ptr)
-            decref_pyobj_ptr(v_ptr)
-            CheckStatusError.check(rc, "ConcurrentDict.__setitem__")
-        drain_deferred_decrefs()
+        enter_borrow()
+        try:
+            rc = lib.ll_ctrie_put(
+                self._ptr, kind, iv, fv, c_bytes, len(bv), k_ptr, v_ptr, ffi.NULL, ffi.NULL
+            )
+            if rc != LF_OK:
+                decref_pyobj_ptr(k_ptr)
+                decref_pyobj_ptr(v_ptr)
+                CheckStatusError.check(rc, "ConcurrentDict.__setitem__")
+        finally:
+            exit_borrow()
 
     def __delitem__(self, key: K) -> None:
         self._check_alive()
         kind, iv, fv, bv = encode_key(key)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
-        rc = lib.ll_ctrie_remove(self._ptr, kind, iv, fv, c_bytes, len(bv), ffi.NULL)
-        if rc == LF_OK:
-            drain_deferred_decrefs()
-            return
-        if rc == LF_ERR_EMPTY:
-            drain_deferred_decrefs()
-            raise KeyError(key)
-        CheckStatusError.check(rc, "ConcurrentDict.__delitem__")
+        enter_borrow()
+        try:
+            rc = lib.ll_ctrie_remove(self._ptr, kind, iv, fv, c_bytes, len(bv), ffi.NULL)
+            if rc == LF_OK:
+                return
+            if rc == LF_ERR_EMPTY:
+                raise KeyError(key)
+            CheckStatusError.check(rc, "ConcurrentDict.__delitem__")
+        finally:
+            exit_borrow()
 
     def __contains__(self, key: object) -> bool:
         try:
@@ -679,15 +684,18 @@ class SkipListMap(Generic[K, V]):
         k_ptr = box_pyobj(key)
         v_ptr = box_pyobj(value)
         out_inserted = ffi.new("bool*")
-        rc = lib.ll_skiplist_put(
-            self._ptr, kind, iv, fv, c_bytes, len(bv), k_ptr, v_ptr, out_inserted
-        )
-        if rc != LF_OK:
-            decref_pyobj_ptr(k_ptr)
-            decref_pyobj_ptr(v_ptr)
-            CheckStatusError.check(rc, "SkipListMap.put")
-        drain_deferred_decrefs()
-        return bool(out_inserted[0])
+        enter_borrow()
+        try:
+            rc = lib.ll_skiplist_put(
+                self._ptr, kind, iv, fv, c_bytes, len(bv), k_ptr, v_ptr, out_inserted
+            )
+            if rc != LF_OK:
+                decref_pyobj_ptr(k_ptr)
+                decref_pyobj_ptr(v_ptr)
+                CheckStatusError.check(rc, "SkipListMap.put")
+            return bool(out_inserted[0])
+        finally:
+            exit_borrow()
 
     def put_if_absent(self, key: K, value: V) -> V:
         """Atomically inserts ``value`` if ``key`` is absent, returning the settled value."""
@@ -706,7 +714,7 @@ class SkipListMap(Generic[K, V]):
                 decref_pyobj_ptr(k_ptr)
                 decref_pyobj_ptr(v_ptr)
                 CheckStatusError.check(rc, "SkipListMap.put_if_absent")
-            return unbox_pyobj_borrow(out_val[0])
+            return cast(V, unbox_pyobj_borrow(out_val[0]))
         finally:
             exit_borrow()
 
@@ -716,7 +724,7 @@ class SkipListMap(Generic[K, V]):
     def compute_if_absent(self, key: K, factory: Callable[[K], V]) -> V:
         existing = self.get(key, _MISSING)
         if existing is not _MISSING:
-            return existing
+            return cast(V, existing)
         computed = factory(key)
         return self.put_if_absent(key, computed)
 
@@ -747,7 +755,7 @@ class SkipListMap(Generic[K, V]):
         try:
             rc = lib.ll_skiplist_remove(self._ptr, kind, iv, fv, c_bytes, len(bv), out_val)
             if rc == LF_OK:
-                return unbox_pyobj_borrow(out_val[0])
+                return cast(V, unbox_pyobj_borrow(out_val[0]))
             if rc == LF_ERR_EMPTY:
                 raise KeyError(key)
             CheckStatusError.check(rc, "SkipListMap.remove")
@@ -769,7 +777,7 @@ class SkipListMap(Generic[K, V]):
         val = self.get(key, _MISSING)
         if val is _MISSING:
             raise KeyError(key)
-        return val
+        return cast(V, val)
 
     def __setitem__(self, key: K, value: V) -> None:
         self.put(key, value)
@@ -879,26 +887,33 @@ class SkipListSet(Generic[T]):
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
         item_ptr = box_pyobj(item)
         out_added = ffi.new("bool*")
-        rc = lib.ll_skiplist_set_add(self._ptr, kind, iv, fv, c_bytes, len(bv), item_ptr, out_added)
-        if rc != LF_OK:
-            decref_pyobj_ptr(item_ptr)
-            CheckStatusError.check(rc, "SkipListSet.add")
-        drain_deferred_decrefs()
-        return bool(out_added[0])
+        enter_borrow()
+        try:
+            rc = lib.ll_skiplist_set_add(
+                self._ptr, kind, iv, fv, c_bytes, len(bv), item_ptr, out_added
+            )
+            if rc != LF_OK:
+                decref_pyobj_ptr(item_ptr)
+                CheckStatusError.check(rc, "SkipListSet.add")
+            return bool(out_added[0])
+        finally:
+            exit_borrow()
 
     def remove(self, item: T) -> None:
         """Removes ``item`` from the set, raising ``KeyError`` if absent."""
         self._check_alive()
         kind, iv, fv, bv = encode_key(item, ordered=True)
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
-        rc = lib.ll_skiplist_set_remove(self._ptr, kind, iv, fv, c_bytes, len(bv))
-        if rc == LF_OK:
-            drain_deferred_decrefs()
-            return
-        if rc == LF_ERR_EMPTY:
-            drain_deferred_decrefs()
-            raise KeyError(item)
-        CheckStatusError.check(rc, "SkipListSet.remove")
+        enter_borrow()
+        try:
+            rc = lib.ll_skiplist_set_remove(self._ptr, kind, iv, fv, c_bytes, len(bv))
+            if rc == LF_OK:
+                return
+            if rc == LF_ERR_EMPTY:
+                raise KeyError(item)
+            CheckStatusError.check(rc, "SkipListSet.remove")
+        finally:
+            exit_borrow()
 
     def discard(self, item: T) -> bool:
         """Removes ``item`` if present, returning ``True`` if removed or ``False`` if absent."""
@@ -915,9 +930,11 @@ class SkipListSet(Generic[T]):
         except TypeError:
             return False
         c_bytes = ffi.from_buffer("uint8_t[]", bv) if bv else ffi.NULL
-        res = bool(lib.ll_skiplist_set_contains(self._ptr, kind, iv, fv, c_bytes, len(bv)))
-        drain_deferred_decrefs()
-        return res
+        enter_borrow()
+        try:
+            return bool(lib.ll_skiplist_set_contains(self._ptr, kind, iv, fv, c_bytes, len(bv)))
+        finally:
+            exit_borrow()
 
     def __len__(self) -> int:
         self._check_alive()

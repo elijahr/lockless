@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import math
 import os
 import threading
 import time
 import weakref
 from collections.abc import AsyncIterator, Iterator
-from pathlib import Path
-from typing import Any, Generic, TypeVar
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Generic, TypeVar, cast
 
 from ._cabi import (
     LF_ERR_CLOSED,
@@ -22,6 +23,7 @@ from ._cabi import (
     Empty,
     Full,
     box_pyobj,
+    cdll,
     decref_pyobj_ptr,
     drain_deferred_decrefs,
     ffi,
@@ -33,33 +35,10 @@ from .queues import BQueue128, MpmcQueue
 T = TypeVar("T")
 
 _MISSING = object()
-
-
-def _load_rv_cdll() -> ctypes.CDLL:
-    pkg_dir = Path(__file__).resolve().parent
-    for name in ("liblockless_ext.dylib", "liblockless_ext.so", "lockless_ext.dll"):
-        p = pkg_dir / name
-        if p.exists():
-            cdll = ctypes.CDLL(str(p))
-            cdll.lf_rendezvous_send_timeout.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_void_p,
-                ctypes.c_int32,
-                ctypes.POINTER(ctypes.c_uint64),
-            ]
-            cdll.lf_rendezvous_send_timeout.restype = ctypes.c_int
-            cdll.lf_rendezvous_recv_timeout.argtypes = [
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_void_p),
-                ctypes.c_int32,
-                ctypes.POINTER(ctypes.c_uint64),
-            ]
-            cdll.lf_rendezvous_recv_timeout.restype = ctypes.c_int
-            return cdll
-    raise RuntimeError("Could not locate liblockless_ext for ctypes CDLL")
-
-
-_rv_cdll = _load_rv_cdll()
+_RENDEZVOUS_EXECUTOR = ThreadPoolExecutor(
+    max_workers=256,
+    thread_name_prefix="lockless-rendezvous",
+)
 
 
 class Channel(Generic[T]):
@@ -97,6 +76,7 @@ class Channel(Generic[T]):
         "_spsc",
         "_w_fd",
         "_waiting_readers",
+        "_waiting_writers",
     )
 
     def __init__(self, capacity: int | None = 1024, *, spsc: bool = False) -> None:
@@ -118,6 +98,7 @@ class Channel(Generic[T]):
         self._not_empty_cond = threading.Condition(self._lock)
         self._not_full_cond = threading.Condition(self._lock)
         self._waiting_readers = 0
+        self._waiting_writers = 0
         self._async_read_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
         self._async_write_waiters: list[tuple[asyncio.AbstractEventLoop, asyncio.Future[None]]] = []
         self._registered_loops: set[asyncio.AbstractEventLoop] = set()
@@ -211,10 +192,18 @@ class Channel(Generic[T]):
         self._registered_loops.clear()
 
     def _notify_after_push(self, was_empty: bool) -> None:
+        if (
+            self._waiting_readers == 0
+            and not self._async_read_waiters
+            and (not was_empty or not self._registered_loops)
+        ):
+            return
         with self._lock:
-            has_sync_waiters = was_empty or self._waiting_readers > 0
-            has_async_waiters = len(self._async_read_waiters) > 0 or len(self._registered_loops) > 0
-            if has_async_waiters and (was_empty or len(self._async_read_waiters) > 0):
+            has_sync_waiters = self._waiting_readers > 0
+            has_async_waiters = len(self._async_read_waiters) > 0 or (
+                was_empty and len(self._registered_loops) > 0
+            )
+            if has_async_waiters:
                 self._signal_wakeup_pipe()
             if has_sync_waiters:
                 self._not_empty_cond.notify_all()
@@ -222,8 +211,11 @@ class Channel(Generic[T]):
             self._wake_async_readers()
 
     def _notify_after_pop(self) -> None:
+        if self._waiting_writers == 0 and not self._async_write_waiters:
+            return
         with self._lock:
-            self._not_full_cond.notify_all()
+            if self._waiting_writers > 0:
+                self._not_full_cond.notify_all()
             has_writers = len(self._async_write_waiters) > 0
         if has_writers:
             self._wake_async_writers()
@@ -260,15 +252,19 @@ class Channel(Generic[T]):
                 with self._lock:
                     if self._closed or self._destroyed:
                         raise Closed("Channel is closed") from None
-                    if not self._queue.is_full:
-                        continue
-                    if deadline is not None:
-                        rem = deadline - time.monotonic()
-                        if rem <= 0:
-                            raise Full("Channel.send timed out while full") from None
-                        self._not_full_cond.wait(timeout=min(rem, 0.005))
-                    else:
-                        self._not_full_cond.wait(timeout=0.005)
+                    self._waiting_writers += 1
+                    try:
+                        if not self._queue.is_full:
+                            continue
+                        if deadline is not None:
+                            rem = deadline - time.monotonic()
+                            if rem <= 0:
+                                raise Full("Channel.send timed out while full") from None
+                            self._not_full_cond.wait(timeout=min(rem, 0.005))
+                        else:
+                            self._not_full_cond.wait(timeout=0.005)
+                    finally:
+                        self._waiting_writers -= 1
 
     def recv_nowait(self) -> T:
         """Dequeues and returns an item immediately, raising ``Empty`` or ``Closed``."""
@@ -529,16 +525,16 @@ class RendezvousChannel(Generic[T]):
             if self._destroyed or self._ptr == ffi.NULL:
                 decref_pyobj_ptr(raw)
                 raise Closed("RendezvousChannel has been destroyed")
-            slice_ms = 20
+            slice_ms = 250
             if deadline is not None:
                 rem = deadline - time.monotonic()
                 if rem <= 0:
                     decref_pyobj_ptr(raw)
                     raise TimeoutError("RendezvousChannel.send timed out")
-                slice_ms = max(1, min(20, int(rem * 1000.0)))
+                slice_ms = max(1, min(250, int(math.ceil(rem * 1000.0))))
 
             rc = int(
-                _rv_cdll.lf_rendezvous_send_timeout(
+                cdll.lf_rendezvous_send_timeout(
                     chan_addr, raw_addr, slice_ms, ctypes.byref(corr)
                 )
             )
@@ -568,21 +564,21 @@ class RendezvousChannel(Generic[T]):
         while True:
             if self._destroyed or self._ptr == ffi.NULL:
                 raise Closed("RendezvousChannel has been destroyed")
-            slice_ms = 20
+            slice_ms = 250
             if deadline is not None:
                 rem = deadline - time.monotonic()
                 if rem <= 0:
                     raise TimeoutError("RendezvousChannel.recv timed out")
-                slice_ms = max(1, min(20, int(rem * 1000.0)))
+                slice_ms = max(1, min(250, int(math.ceil(rem * 1000.0))))
 
             rc = int(
-                _rv_cdll.lf_rendezvous_recv_timeout(
+                cdll.lf_rendezvous_recv_timeout(
                     chan_addr, ctypes.byref(out_payload), slice_ms, ctypes.byref(corr)
                 )
             )
             if rc == LF_OK:
                 ptr_val = out_payload.value or 0
-                return unbox_pyobj_steal(ffi.cast("void*", ptr_val))
+                return cast(T, unbox_pyobj_steal(ffi.cast("void*", ptr_val)))
             if rc == LF_ERR_CLOSED:
                 raise Closed("RendezvousChannel is closed")
             if rc != LF_ERR_EMPTY:
@@ -593,11 +589,11 @@ class RendezvousChannel(Generic[T]):
 
     async def send_async(self, item: T, timeout: float | None = None) -> int:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.send, item, timeout)
+        return await loop.run_in_executor(_RENDEZVOUS_EXECUTOR, self.send, item, timeout)
 
     async def recv_async(self, timeout: float | None = None) -> T:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.recv, timeout)
+        return await loop.run_in_executor(_RENDEZVOUS_EXECUTOR, self.recv, timeout)
 
     def close(self) -> None:
         if not self._destroyed and self._ptr != ffi.NULL:

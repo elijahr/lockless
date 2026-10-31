@@ -2,40 +2,14 @@
 
 from __future__ import annotations
 
-import ctypes
-from pathlib import Path
 from typing import Any
 
 from ._cabi import (
     Closed,
+    cdll,
     ffi,
     lib,
 )
-
-
-def _load_cdll() -> ctypes.CDLL:
-    pkg_dir = Path(__file__).resolve().parent
-    for name in ("liblockless_ext.dylib", "liblockless_ext.so", "lockless_ext.dll"):
-        p = pkg_dir / name
-        if p.exists():
-            cdll = ctypes.CDLL(str(p))
-            cdll.lf_token_bucket_acquire_timeout.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-                ctypes.c_int64,
-            ]
-            cdll.lf_token_bucket_acquire_timeout.restype = ctypes.c_bool
-            cdll.lf_leaky_bucket_consume_timeout.argtypes = [
-                ctypes.c_void_p,
-                ctypes.c_uint64,
-                ctypes.c_int64,
-            ]
-            cdll.lf_leaky_bucket_consume_timeout.restype = ctypes.c_bool
-            return cdll
-    raise RuntimeError(f"Could not load CDLL from {pkg_dir}")
-
-
-_cdll = _load_cdll()
 
 
 class TokenBucket:
@@ -113,7 +87,7 @@ class TokenBucket:
                 raise ValueError("timeout must be non-negative")
             max_wait_ns = int(timeout * 1_000_000_000)
         addr = int(ffi.cast("uintptr_t", self._ptr))
-        return bool(_cdll.lf_token_bucket_acquire_timeout(addr, tokens, max_wait_ns))
+        return bool(cdll.lf_token_bucket_acquire_timeout(addr, tokens, max_wait_ns))
 
     acquire_timeout = acquire
 
@@ -231,7 +205,7 @@ class LeakyBucket:
                 raise ValueError("timeout must be non-negative")
             max_wait_ns = int(timeout * 1_000_000_000)
         addr = int(ffi.cast("uintptr_t", self._ptr))
-        return bool(_cdll.lf_leaky_bucket_consume_timeout(addr, units, max_wait_ns))
+        return bool(cdll.lf_leaky_bucket_consume_timeout(addr, units, max_wait_ns))
 
     acquire_timeout = acquire
 

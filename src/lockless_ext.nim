@@ -34,9 +34,12 @@
 ## ==============================================================================
 
 import std/[hashes, options]
-import lockfree/atomics
+from std/atomics as std_atomics import nil
+import naganim/[abi, lifecycle, gc_bridge]
+export lifecycle, gc_bridge
+import lockfree/atomics as lf_atomics
 import lockfree/atomics/backoff
-from lockfree/smr/nebr import registerThread, unregisterThread, DebraManager, reclaimNow
+from lockfree/smr/nebr import registerThread, unregisterThread, DebraManager, reclaimNow, ThreadHandle
 import lockfree/bqueue
 import lockfree/bqueue128
 import lockfree/stack
@@ -52,15 +55,11 @@ export cabi
 {.push hint[Name]: off.}
 
 # ==============================================================================
-# 1. Wait-Free Deferred Py_DecRef Queue (GIL-Free SMR Reclamation)
+# 1. Wait-Free Deferred Py_DecRef Queue (Delegated to naganim/gc_bridge)
 # ==============================================================================
 
 var
-  gDeferredFastInitialized {.global.}: Atomic[int]
-  gDeferredFastQueue {.global, align: CacheLineBytes.}: ptr BQueue128[pointer, 65536]
-  gDeferredOverflowStack {.global, align: CacheLineBytes.}: TreiberStack[pointer]
-  gDeferredPendingCount {.global, align: CacheLineBytes.}: Atomic[int64]
-  gActiveBorrowers {.global, align: CacheLineBytes.}: Atomic[int]
+  gActiveBorrowers {.global, align: CacheLineBytes.}: lf_atomics.Atomic[int]
 
 proc ll_enter_borrow*() {.exportc: "ll_enter_borrow", cdecl, gcsafe, raises: [].} =
   discard gActiveBorrowers.fetchAdd(1, moAcquireRelease)
@@ -68,34 +67,10 @@ proc ll_enter_borrow*() {.exportc: "ll_enter_borrow", cdecl, gcsafe, raises: [].
 proc ll_exit_borrow*() {.exportc: "ll_exit_borrow", cdecl, gcsafe, raises: [].} =
   discard gActiveBorrowers.fetchSub(1, moAcquireRelease)
 
-proc ensureDeferredQueue() {.inline, gcsafe, raises: [].} =
-  let st = gDeferredFastInitialized.load(moAcquire)
-  if likely(st == 2):
-    return
-  var expected = 0
-  if gDeferredFastInitialized.compareExchange(expected, 1, moAcquireRelease, moAcquire):
-    try:
-      gDeferredFastQueue = allocAlignedBQueue128[pointer, 65536]()
-      gDeferredOverflowStack = initTreiberStack[pointer]()
-    except CatchableError, Defect:
-      gDeferredFastQueue = nil
-    gDeferredFastInitialized.store(2, moRelease)
-  else:
-    while gDeferredFastInitialized.load(moAcquire) != 2:
-      cpuPause()
-
 proc ll_retire_pyobj*(pyobj: pointer) {.exportc: "ll_retire_pyobj", cdecl, gcsafe, raises: [].} =
   if unlikely(pyobj == nil):
     return
-  ensureDeferredQueue()
-  discard gDeferredPendingCount.fetchAdd(1'i64, moRelaxed)
-  if likely(gDeferredFastQueue != nil):
-    if gDeferredFastQueue[].tryPush(pyobj):
-      return
-  try:
-    gDeferredOverflowStack.push(pyobj)
-  except CatchableError, Defect:
-    discard
+  enqueueDeferredDecRef(cast[PyObjectPtr](pyobj))
 
 proc ll_pop_deferred_decref*(out_pyobj: ptr pointer): bool {.
     exportc: "ll_pop_deferred_decref", cdecl, gcsafe, raises: [].} =
@@ -104,24 +79,26 @@ proc ll_pop_deferred_decref*(out_pyobj: ptr pointer): bool {.
   if gActiveBorrowers.load(moAcquire) > 0:
     out_pyobj[] = nil
     return false
-  if gDeferredPendingCount.load(moAcquire) <= 0:
+  if deferredDecRefPendingCount() <= 0:
     out_pyobj[] = nil
     return false
-  ensureDeferredQueue()
-  if likely(gDeferredFastQueue != nil):
+  ensureDeferredQueueInitialized()
+  if likely(gDeferredDecRefQueuePtr != nil):
     var item: pointer = nil
-    if gDeferredFastQueue[].tryPop(item):
-      discard gDeferredPendingCount.fetchSub(1'i64, moRelaxed)
-      out_pyobj[] = item
-      return true
-  try:
-    let opt = gDeferredOverflowStack.pop()
-    if opt.isSome:
-      discard gDeferredPendingCount.fetchSub(1'i64, moRelaxed)
-      out_pyobj[] = opt.get
-      return true
-  except CatchableError, Defect:
-    discard
+    {.cast(gcsafe), cast(raises: []).}:
+      if gDeferredDecRefQueuePtr[].tryPop(item):
+        discard std_atomics.fetchSub(gDeferredPendingCount, 1, std_atomics.moAcquireRelease)
+        out_pyobj[] = item
+        return true
+  {.cast(gcsafe), cast(raises: []).}:
+    try:
+      let opt = gOverflowDecRefStack.pop()
+      if opt.isSome:
+        discard std_atomics.fetchSub(gDeferredPendingCount, 1, std_atomics.moAcquireRelease)
+        out_pyobj[] = opt.get
+        return true
+    except CatchableError, Defect:
+      discard
   out_pyobj[] = nil
   return false
 
@@ -142,7 +119,7 @@ proc ll_pop_deferred_decref_batch*(
 
 proc ll_deferred_decref_count*(): csize_t {.
     exportc: "ll_deferred_decref_count", cdecl, gcsafe, raises: [].} =
-  let c = gDeferredPendingCount.load(moAcquire)
+  let c = deferredDecRefPendingCount()
   if c <= 0: 0.csize_t else: csize_t(c)
 
 # ==============================================================================
@@ -172,8 +149,8 @@ proc spscLen[N: static int](q: ptr ll_spsc_t): csize_t {.nimcall, gcsafe, raises
   let impl = cast[ptr SpscImpl[N]](q)
   let h = impl.raw.head.load(moAcquire)
   let t = impl.raw.tail.load(moAcquire)
-  let ringLen = N + 1
-  let used = if t >= h: t - h else: ringLen - h + t
+  let virtSpace = 2 * (N + 1)
+  let used = if t >= h: t - h else: virtSpace - h + t
   return csize_t(max(0, min(N, used)))
 
 proc spscCap[N: static int](q: ptr ll_spsc_t): csize_t {.nimcall, gcsafe, raises: [].} =
@@ -206,11 +183,12 @@ proc spscPushEx[N: static int](
     return LF_ERR_CLOSED
   let impl = cast[ptr SpscImpl[N]](q)
   try:
+    let tBefore = impl.raw.tail.load(moRelaxed)
     let hBefore = impl.raw.head.load(moAcquire)
-    let tBefore = impl.raw.tail.load(moAcquire)
     if impl.raw[].push(item):
       if outWasEmpty != nil:
-        outWasEmpty[] = (hBefore == tBefore)
+        let hAfter = impl.raw.head.load(moSequentiallyConsistent)
+        outWasEmpty[] = (hBefore == tBefore) or (hAfter == tBefore)
       return LF_OK
     if outWasEmpty != nil:
       outWasEmpty[] = false
@@ -241,7 +219,7 @@ proc spscPeek[N: static int](q: ptr ll_spsc_t, outItem: ptr pointer): lf_status_
     if q.isClosed.load(moAcquire):
       return LF_ERR_CLOSED
     return LF_ERR_EMPTY
-  outItem[] = impl.raw.storage.data[h]
+  outItem[] = impl.raw.storage.data[h mod (N + 1)]
   return LF_OK
 
 proc spscPopBatch[N: static int](
@@ -514,6 +492,51 @@ proc ll_broadcast_destroy*(
   except CatchableError, Defect:
     return LF_ERR_FAILURE
 
+proc sweepRetiredBroadcastBoxes(core: ptr BroadcastRingCore[PyBroadcastBox]) {.inline, gcsafe, raises: [].} =
+  if core == nil:
+    return
+  for idx in 0 ..< core.capacity:
+    let rb = core.slots[idx].retiredBox.load(moAcquire)
+    if rb != nil and rb.rc.load(moAcquire) == 1:
+      var pinned = false
+      for cIdx in 0 ..< core.maxReaders:
+        if core.cursors[cIdx].readingBox.load(moSequentiallyConsistent) == cast[pointer](rb):
+          pinned = true
+          break
+      if not pinned:
+        var expected = rb
+        if core.slots[idx].retiredBox.compareExchangeStrong(expected, nil, moAcquireRelease, moAcquire):
+          if rb.rc.load(moAcquire) == 1:
+            var pinnedAfter = false
+            for cIdx in 0 ..< core.maxReaders:
+              if core.cursors[cIdx].readingBox.load(moSequentiallyConsistent) == cast[pointer](rb):
+                pinnedAfter = true
+                break
+            if not pinnedAfter:
+              `=destroy`(rb.val)
+              deallocShared(rb)
+            else:
+              var nilBox: ptr broadcast.VBox[PyBroadcastBox] = nil
+              if not core.slots[idx].retiredBox.compareExchangeStrong(nilBox, rb, moAcquireRelease, moAcquire):
+                while true:
+                  var stillPinned = false
+                  for cIdx in 0 ..< core.maxReaders:
+                    if core.cursors[cIdx].readingBox.load(moSequentiallyConsistent) == cast[pointer](rb):
+                      stillPinned = true
+                      break
+                  if not stillPinned:
+                    break
+                  cpuPause()
+                `=destroy`(rb.val)
+                deallocShared(rb)
+          else:
+            var nilBox: ptr broadcast.VBox[PyBroadcastBox] = nil
+            if not core.slots[idx].retiredBox.compareExchangeStrong(nilBox, rb, moAcquireRelease, moAcquire):
+              while rb.rc.load(moAcquire) > 1:
+                cpuPause()
+              `=destroy`(rb.val)
+              deallocShared(rb)
+
 proc ll_broadcast_publish*(
     broadcast: ptr ll_broadcast_t,
     item: pointer
@@ -526,25 +549,7 @@ proc ll_broadcast_publish*(
     let h = allocPyRefHolder(item)
     var box = PyBroadcastBox(holder: h, tag: 1'u64)
     broadcast.raw[].publish(move(box))
-    # Immediately reclaim any retiredBox from the overwritten slot if unpinned!
-    let core = broadcast.raw.core
-    if core != nil:
-      let headSeq = core.publishedHead.load(moAcquire)
-      if headSeq > 0:
-        let idx = (headSeq - 1) and core.mask
-        let rb = core.slots[idx].retiredBox.load(moAcquire)
-        if rb != nil and rb.rc.load(moAcquire) == 1:
-          # Check if any active cursor has hazard pointer on rb
-          var pinned = false
-          for cIdx in 0 ..< core.maxReaders:
-            if core.cursors[cIdx].readingBox.load(moSequentiallyConsistent) == cast[pointer](rb):
-              pinned = true
-              break
-          if not pinned:
-            var expected = rb
-            if core.slots[idx].retiredBox.compareExchangeStrong(expected, nil, moAcquireRelease, moAcquire):
-              `=destroy`(rb.val)
-              deallocShared(rb)
+    sweepRetiredBroadcastBoxes(broadcast.raw.core)
     return LF_OK
   except CatchableError, Defect:
     return LF_ERR_FAILURE
@@ -563,23 +568,7 @@ proc ll_broadcast_try_publish*(
     var box = PyBroadcastBox(holder: h, tag: 1'u64)
     if broadcast.raw[].tryPublish(move(box)):
       decRefHolder(h)
-      let core = broadcast.raw.core
-      if core != nil:
-        let headSeq = core.publishedHead.load(moAcquire)
-        if headSeq > 0:
-          let idx = (headSeq - 1) and core.mask
-          let rb = core.slots[idx].retiredBox.load(moAcquire)
-          if rb != nil and rb.rc.load(moAcquire) == 1:
-            var pinned = false
-            for cIdx in 0 ..< core.maxReaders:
-              if core.cursors[cIdx].readingBox.load(moSequentiallyConsistent) == cast[pointer](rb):
-                pinned = true
-                break
-            if not pinned:
-              var expected = rb
-              if core.slots[idx].retiredBox.compareExchangeStrong(expected, nil, moAcquireRelease, moAcquire):
-                `=destroy`(rb.val)
-                deallocShared(rb)
+      sweepRetiredBroadcastBoxes(broadcast.raw.core)
       return LF_OK
     else:
       # Roll back holder without retiring pyobj (caller retains ownership on Full)
@@ -873,6 +862,46 @@ proc `=sink`(dest: var PyKVBox, src: PyKVBox) {.gcsafe, raises: [].} =
 
 # --- 4A. ConcurrentDict (`ll_ctrie_t`) ---
 
+proc hasActiveDebraPin[MaxThreads: static int, CC: static PinScopeCardinality](
+    mgr: ptr DebraManager[MaxThreads, CC]
+): bool {.inline, gcsafe, raises: [].} =
+  if mgr == nil:
+    return false
+  let mask = mgr.activeThreadMask.load(moAcquire)
+  for i in 0 ..< MaxThreads:
+    if (mask and (1'u64 shl i)) != 0'u64:
+      if mgr.threads[i].pinned.load(moAcquire):
+        return true
+  return false
+
+proc trySafeReclaim[MaxThreads: static int, CC: static PinScopeCardinality](
+    th: ThreadHandle[MaxThreads, CC]
+) {.inline, gcsafe, raises: [].} =
+  ## Reclaims retired DEBRA+ nodes on the calling thread. Only advances
+  ## `globalEpoch` when no DEBRA+ readers (`hasActiveDebraPin`) are pinned in
+  ## flight; if any concurrent reader is pinned, runs a non-forced `reclaimNow`
+  ## respecting all pinned threads' epochs. Retired `PyObject*` pointers are
+  ## enqueued to the naganim deferred decref queue, which remains gated by
+  ## `gActiveBorrowers` until all active borrows exit.
+  if th.manager == nil:
+    return
+  if hasActiveDebraPin(th.manager):
+    {.cast(gcsafe).}:
+      try:
+        discard reclaimNow(th)
+      except CatchableError, Defect:
+        discard
+    return
+  for _ in 0 .. 3:
+    if hasActiveDebraPin(th.manager):
+      break
+    discard th.manager.globalEpoch.fetchAdd(1'u64, moRelease)
+    {.cast(gcsafe).}:
+      try:
+        discard reclaimNow(th)
+      except CatchableError, Defect:
+        discard
+
 type
   ll_ctrie_t* {.exportc: "ll_ctrie_t".} = object
     raw*: ptr Ctrie[LlKey, PyKVBox]
@@ -938,13 +967,9 @@ proc ll_ctrie_put*(
       if out_replaced != nil: out_replaced[] = true
       if out_old_val_pyobj != nil:
         out_old_val_pyobj[] = if prev.get.holder != nil: prev.get.holder.valObj else: nil
-      # Only reclaim retired SNode when no active Snapshot holds an older generation (`rc <= 1`).
       if ctrie.raw.core != nil and ctrie.raw.core.rc.load(moAcquire) <= 1:
         let th = ctrie.raw[].getOrRegisterHandle()
-        for _ in 0 .. 3:
-          discard ctrie.raw.core.manager.globalEpoch.fetchAdd(1'u64, moRelease)
-          {.cast(gcsafe).}:
-            discard reclaimNow(th)
+        trySafeReclaim(th)
     else:
       if out_replaced != nil: out_replaced[] = false
       if out_old_val_pyobj != nil: out_old_val_pyobj[] = nil
@@ -974,8 +999,6 @@ proc ll_ctrie_put_if_absent*(
       if out_inserted != nil: out_inserted[] = false
       if out_existing_val_pyobj != nil:
         out_existing_val_pyobj[] = if prev.get.holder != nil: prev.get.holder.valObj else: nil
-      # Key was already present; `box` was not inserted and will be destroyed at scope exit,
-      # which retires `key_pyobj` and `val_pyobj` via `ll_retire_pyobj`.
     else:
       if out_inserted != nil: out_inserted[] = true
       if out_existing_val_pyobj != nil:
@@ -1025,13 +1048,9 @@ proc ll_ctrie_remove*(
       let valPtr = opt.get.holder.valObj
       if out_val_pyobj != nil:
         out_val_pyobj[] = valPtr
-      # Only reclaim retired SNode when no active Snapshot holds an older generation (`rc <= 1`).
       if ctrie.raw.core != nil and ctrie.raw.core.rc.load(moAcquire) <= 1:
         let th = ctrie.raw[].getOrRegisterHandle()
-        for _ in 0 .. 3:
-          discard ctrie.raw.core.manager.globalEpoch.fetchAdd(1'u64, moRelease)
-          {.cast(gcsafe).}:
-            discard reclaimNow(th)
+        trySafeReclaim(th)
       return LF_OK
     if out_val_pyobj != nil:
       out_val_pyobj[] = nil
@@ -1100,10 +1119,7 @@ proc ll_ctrie_snapshot_destroy*(
       {.cast(gcsafe).}:
         `=destroy`(snap.raw[])
       if core.rc.load(moAcquire) == 1 and th.manager != nil:
-        for _ in 0 .. 3:
-          discard th.manager.globalEpoch.fetchAdd(1'u64, moRelease)
-          {.cast(gcsafe).}:
-            discard reclaimNow(th)
+        trySafeReclaim(th)
     else:
       {.cast(gcsafe).}:
         `=destroy`(snap.raw[])
@@ -1233,9 +1249,7 @@ proc ll_skiplist_put*(
         out_inserted[] = inserted
       if not inserted:
         let th = map.raw[].getOrRegisterHandle()
-        for _ in 0 .. 3:
-          discard th.manager.globalEpoch.fetchAdd(1'u64, moRelease)
-          discard reclaimNow(th)
+        trySafeReclaim(th)
       return LF_OK
     except CatchableError, Defect:
       return LF_ERR_FAILURE
@@ -1305,7 +1319,7 @@ proc ll_skiplist_remove*(
     try:
       let k = makeLlKey(key_kind, key_int, key_float, key_bytes, key_len)
       # Hold `opt` (`Option[PyKVBox]`) in a local variable across `delete(k)` and
-      # `reclaimNow(th)` so `PyKVHolder.rc >= 1` is maintained until `out_val_pyobj[]`
+      # `trySafeReclaim(th)` so `PyKVHolder.rc >= 1` is maintained until `out_val_pyobj[]`
       # has been safely extracted, and `PyKVBox.=destroy` retires `keyObj`/`valObj`
       # cleanly when `opt` exits scope.
       var opt = map.raw[].get(k)
@@ -1313,9 +1327,7 @@ proc ll_skiplist_remove*(
         if out_val_pyobj != nil:
           out_val_pyobj[] = if opt.isSome and opt.get.holder != nil: opt.get.holder.valObj else: nil
         let th = map.raw[].getOrRegisterHandle()
-        for _ in 0 .. 3:
-          discard th.manager.globalEpoch.fetchAdd(1'u64, moRelease)
-          discard reclaimNow(th)
+        trySafeReclaim(th)
         return LF_OK
       if out_val_pyobj != nil:
         out_val_pyobj[] = nil
@@ -1540,6 +1552,10 @@ proc ll_keepalive_cabi*(): int {.exportc: "ll_keepalive_cabi", cdecl, gcsafe, ra
     cast[pointer](lf_token_bucket_refill_rate),
     cast[pointer](lf_leaky_bucket_burst_tolerance_ns),
     cast[pointer](lf_leaky_bucket_leak_rate),
+    cast[pointer](naganim_init_runtime),
+    cast[pointer](naganim_shutdown_runtime),
+    cast[pointer](naganim_flush_deferred_decrefs),
+    cast[pointer](naganim_deferred_decref_count),
     cast[pointer](ll_enter_borrow),
     cast[pointer](ll_exit_borrow),
     cast[pointer](ll_register_py_compare),

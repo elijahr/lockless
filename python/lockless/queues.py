@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import weakref
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 from ._cabi import (
     LF_ERR_CLOSED,
@@ -130,7 +130,7 @@ class BQueue128(Generic[T]):
             if rc == LF_ERR_EMPTY and self._closed:
                 raise Closed("BQueue128 is closed")
             CheckStatusError.check(rc, "BQueue128.pop")
-        return unbox_pyobj_steal(out_item[0])
+        return cast(T, unbox_pyobj_steal(out_item[0]))
 
     get_nowait = pop
 
@@ -258,6 +258,17 @@ class SpscQueue(Generic[T]):
             decref_pyobj_ptr(raw)
             CheckStatusError.check(rc, "SpscQueue.push")
 
+    def push_ex(self, item: T) -> bool:
+        """Enqueues ``item`` and returns ``True`` if the queue transitioned from 0 to 1 item."""
+        self._check_alive()
+        raw = box_pyobj(item)
+        was_empty = ffi.new("bool*")
+        rc = lib.ll_spsc_push_ex(self._ptr, raw, was_empty)
+        if rc != LF_OK:
+            decref_pyobj_ptr(raw)
+            CheckStatusError.check(rc, "SpscQueue.push_ex")
+        return bool(was_empty[0])
+
     def try_push(self, item: T) -> bool:
         """Attempts to enqueue ``item``, returning ``False`` if full."""
         self._check_alive()
@@ -280,7 +291,7 @@ class SpscQueue(Generic[T]):
         rc = lib.ll_spsc_pop(self._ptr, out_item)
         if rc != LF_OK:
             CheckStatusError.check(rc, "SpscQueue.pop")
-        return unbox_pyobj_steal(out_item[0])
+        return cast(T, unbox_pyobj_steal(out_item[0]))
 
     get_nowait = pop
 
@@ -423,7 +434,7 @@ class MpmcConsumer(Generic[T]):
         rc = lib.lf_pop(self._ptr, out_item)
         if rc != LF_OK:
             CheckStatusError.check(rc, "MpmcConsumer.pop")
-        return unbox_pyobj_steal(out_item[0])
+        return cast(T, unbox_pyobj_steal(out_item[0]))
 
     def try_pop(self, default: Any = None) -> Any:
         if self._closed or self._ptr == ffi.NULL or self._queue._destroyed:
@@ -669,7 +680,7 @@ class MpmcQueue(Generic[T]):
         rc = lib.lf_pop(cons, out_item)
         if rc != LF_OK:
             CheckStatusError.check(rc, "MpmcQueue.pop")
-        return unbox_pyobj_steal(out_item[0])
+        return cast(T, unbox_pyobj_steal(out_item[0]))
 
     get_nowait = pop
 

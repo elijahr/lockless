@@ -42,7 +42,7 @@ typedef struct lf_producer_t lf_producer_t;
 typedef struct lf_consumer_t lf_consumer_t;
 typedef struct lf_bqueue128_t lf_bqueue128_t;
 typedef struct ll_spsc_t ll_spsc_t;
-typedef struct lf_stream_ring_t lf_streambuffer_t;
+typedef struct lf_streambuffer_t lf_streambuffer_t;
 typedef struct ll_broadcast_t ll_broadcast_t;
 typedef struct ll_broadcast_cursor_t ll_broadcast_cursor_t;
 typedef struct ll_ctrie_t ll_ctrie_t;
@@ -60,7 +60,11 @@ typedef void (*lf_task_fn)(void* arg);
 typedef void (*lf_for_task_fn)(size_t index, void* arg);
 typedef int (*ll_py_compare_fn)(void* a, void* b, int op);
 
-/* Deferred Py_DecRef queue */
+/* Deferred Py_DecRef queue (backed by naganim/gc_bridge & naganim/lifecycle) */
+int naganim_init_runtime(void);
+int naganim_shutdown_runtime(void);
+int naganim_flush_deferred_decrefs(void);
+int naganim_deferred_decref_count(void);
 void ll_enter_borrow(void);
 void ll_exit_borrow(void);
 void ll_register_py_compare(ll_py_compare_fn fn);

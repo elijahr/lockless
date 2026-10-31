@@ -121,15 +121,29 @@ def test_taskpool_submit_map_and_parallel_for() -> None:
         pool.parallel_for(0, 64, fill_one, chunk_size=8)
         assert slots == [i + 100 for i in range(64)]
 
-        # parallel_for with 2-arg chunk range callback
+        # parallel_for with 2-arg chunk range callback (verifies real chunk ranges, LL-CRIT-06)
         chunk_slots = [0] * 64
+        recorded_chunks: list[tuple[int, int]] = []
+        chunk_lock = threading.Lock()
 
         def fill_chunk(start: int, stop: int) -> None:
+            with chunk_lock:
+                recorded_chunks.append((start, stop))
             for j in range(start, stop):
                 chunk_slots[j] = j * 2
 
         pool.parallel_for(0, 64, fill_chunk, chunk_size=16)
         assert chunk_slots == [i * 2 for i in range(64)]
+        assert sorted(recorded_chunks) == [(0, 16), (16, 32), (32, 48), (48, 64)]
+
+        ragged_chunks: list[tuple[int, int]] = []
+
+        def collect_ragged(start: int, stop: int) -> None:
+            with chunk_lock:
+                ragged_chunks.append((start, stop))
+
+        pool.parallel_for(10, 25, collect_ragged, chunk_size=6)
+        assert sorted(ragged_chunks) == [(10, 16), (16, 22), (22, 25)]
 
         # Negative control: exception propagation in submit and parallel_for
         bad_fut = pool.submit(lambda: 1 / 0)
@@ -196,3 +210,52 @@ def test_token_bucket_and_leaky_bucket() -> None:
         TokenBucket(0, 100)
     with pytest.raises(ValueError):
         LeakyBucket(10, -1)
+
+
+def test_channel_uncontended_fast_path_is_lock_free() -> None:
+    ch: Channel[int] = Channel(capacity=64)
+
+    class _ForbiddenLock:
+        def __enter__(self) -> None:
+            raise AssertionError("Channel._lock must not be acquired on uncontended fast path")
+
+        def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+            pass
+
+    real_lock = ch._lock
+    ch._lock = _ForbiddenLock()  # type: ignore[assignment]
+    try:
+        for i in range(32):
+            assert ch.try_send(i) is True
+        for i in range(32, 48):
+            ch.send_nowait(i)
+        for i in range(48, 64):
+            ch.send(i)
+        assert len(ch) == 64
+
+        popped = [ch.recv_nowait() for _ in range(32)]
+        popped.extend(ch.try_recv() for _ in range(16))
+        popped.extend(ch.recv() for _ in range(16))
+        assert popped == list(range(64))
+        assert ch.is_empty is True
+    finally:
+        ch._lock = real_lock
+        ch.destroy()
+
+
+def test_rendezvous_channel_high_concurrency_async_no_starvation() -> None:
+    async def scenario() -> list[int]:
+        rv: RendezvousChannel[int] = RendezvousChannel()
+        n = 40
+        recv_tasks = [asyncio.create_task(rv.recv_async(timeout=5.0)) for _ in range(n)]
+        await asyncio.sleep(0.02)
+        send_tasks = [asyncio.create_task(rv.send_async(i, timeout=5.0)) for i in range(n)]
+
+        corr_ids = await asyncio.gather(*send_tasks)
+        values = await asyncio.gather(*recv_tasks)
+        assert len(corr_ids) == n
+        assert all(cid > 0 for cid in corr_ids)
+        rv.destroy()
+        return sorted(values)
+
+    assert asyncio.run(scenario()) == list(range(40))

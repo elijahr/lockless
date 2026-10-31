@@ -246,3 +246,55 @@ def test_unbounded_mpmc_direct_multithreaded_and_handle_invalidation() -> None:
         cons_handle.pop()
     prod_handle.close()
     cons_handle.close()
+
+
+def test_spsc_queue_push_ex_and_concurrent_wakeup_accuracy() -> None:
+    q: SpscQueue[int] = SpscQueue(4)
+    assert q.push_ex(10) is True
+    assert q.push_ex(20) is False
+    assert q.push_ex(30) is False
+    assert q.push_ex(40) is False
+    with pytest.raises(Full):
+        q.push_ex(50)
+
+    assert [q.pop(), q.pop(), q.pop(), q.pop()] == [10, 20, 30, 40]
+    assert q.is_empty is True
+    assert q.push_ex(99) is True
+    assert q.pop() == 99
+
+    # Concurrent producer + consumer using push_ex for 0-to-1 wakeup notifications
+    cq: SpscQueue[int] = SpscQueue(64)
+    wake_ev = threading.Event()
+    total = 2000
+    received: list[int] = []
+
+    def producer() -> None:
+        for i in range(total):
+            while True:
+                try:
+                    was_empty = cq.push_ex(i)
+                    if was_empty:
+                        wake_ev.set()
+                    break
+                except Full:
+                    pass
+
+    def consumer() -> None:
+        while len(received) < total:
+            item = cq.try_pop()
+            if item is not None:
+                received.append(item)
+            else:
+                wake_ev.wait(timeout=0.001)
+                wake_ev.clear()
+
+    tp = threading.Thread(target=producer)
+    tc = threading.Thread(target=consumer)
+    tp.start()
+    tc.start()
+    tp.join()
+    tc.join()
+
+    assert received == list(range(total))
+    cq.destroy()
+    q.destroy()

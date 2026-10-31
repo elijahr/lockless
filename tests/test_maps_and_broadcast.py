@@ -369,3 +369,107 @@ def test_broadcast_ring_destroy_invalidates_active_subscribers() -> None:
         sub.poll()
     # Calling unsubscribe() after ring.destroy() is a safe no-op
     sub.unsubscribe()
+
+
+def test_broadcast_ring_concurrent_publish_and_poll_no_retired_box_leak() -> None:
+    ring: BroadcastRing[_RefPayload] = BroadcastRing(capacity=16, overflow="drop_oldest")
+    sub1 = ring.subscribe(from_earliest=True)
+    sub2 = ring.subscribe(from_earliest=True)
+
+    payloads = [_RefPayload("bcast", i) for i in range(160)]
+    baselines = [sys.getrefcount(p) for p in payloads]
+
+    def publisher() -> None:
+        for p in payloads:
+            ring.publish(p)
+
+    polled1: list[int] = []
+    polled2: list[int] = []
+
+    def reader(sub: object, out: list[int]) -> None:
+        from lockless.maps import Subscriber
+
+        assert isinstance(sub, Subscriber)
+        while True:
+            val = sub.try_poll()
+            if val is not None:
+                out.append(val.num)
+                del val
+            elif ring.is_closed:
+                break
+
+    tp = threading.Thread(target=publisher)
+    tr1 = threading.Thread(target=reader, args=(sub1, polled1))
+    tr2 = threading.Thread(target=reader, args=(sub2, polled2))
+    tp.start()
+    tr1.start()
+    tr2.start()
+    tp.join()
+    ring.close()
+    tr1.join()
+    tr2.join()
+
+    sub1.unsubscribe()
+    sub2.unsubscribe()
+    ring.destroy()
+    drain_deferred_decrefs()
+    gc.collect()
+
+    assert [sys.getrefcount(p) for p in payloads] == baselines
+
+
+def test_debra_concurrent_readers_writers_and_snapshots_no_uaf() -> None:
+    d: ConcurrentDict[int, _RefPayload] = ConcurrentDict()
+    sm: SkipListMap[int, _RefPayload] = SkipListMap()
+    key_count = 32
+    initial_objs = [_RefPayload("init", k) for k in range(key_count)]
+    for k in range(key_count):
+        d[k] = initial_objs[k]
+        sm[k] = initial_objs[k]
+
+    stop_ev = threading.Event()
+    errors: list[BaseException] = []
+
+    def writer_worker(wid: int) -> None:
+        try:
+            for step in range(80):
+                k = (wid * 17 + step) % key_count
+                obj = _RefPayload(f"w{wid}", step)
+                d[k] = obj
+                sm.put(k, obj)
+                if step % 10 == 0:
+                    snap = d.snapshot()
+                    _ = len(snap)
+                    snap.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    def reader_worker() -> None:
+        try:
+            while not stop_ev.is_set():
+                for k in range(key_count):
+                    v1 = d.get(k)
+                    if v1 is not None:
+                        assert isinstance(v1.num, int)
+                    v2 = sm.get(k)
+                    if v2 is not None:
+                        assert isinstance(v2.num, int)
+        except BaseException as exc:
+            errors.append(exc)
+
+    readers = [threading.Thread(target=reader_worker) for _ in range(3)]
+    writers = [threading.Thread(target=writer_worker, args=(w,)) for w in range(2)]
+    for r in readers:
+        r.start()
+    for w in writers:
+        w.start()
+    for w in writers:
+        w.join()
+    stop_ev.set()
+    for r in readers:
+        r.join()
+
+    assert errors == []
+    d.destroy()
+    sm.destroy()
+    drain_deferred_decrefs()

@@ -289,9 +289,14 @@ class StreamBuffer:
         """Reserves ``nbytes`` for zero-copy writing as a bipartite ``(first_view, second_view)``.
 
         Raises ``Full`` if fewer than ``nbytes`` are currently available for writing,
+        ``BufferError`` if a write reservation is already active,
         or ``ValueError`` if ``nbytes < 0``.
         """
         self._check_alive()
+        if self._active_write_reservations:
+            raise BufferError(
+                "Cannot reserve_write while an uncommitted write reservation is already active"
+            )
         if not isinstance(nbytes, int) or isinstance(nbytes, bool) or nbytes < 0:
             raise ValueError(f"nbytes must be a non-negative integer, got {nbytes}")
         if nbytes > self._capacity:
@@ -333,6 +338,10 @@ class StreamBuffer:
     def peek_read(self, max_bytes: int | None = None) -> StreamReadReservation:
         """Peeks at readable bytes as a zero-copy read-only ``(first_view, second_view)`` pair."""
         self._check_alive()
+        if self._active_read_reservations:
+            raise BufferError(
+                "Cannot peek_read while an unconsumed read reservation is already active"
+            )
         if max_bytes is not None and (
             not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0
         ):
