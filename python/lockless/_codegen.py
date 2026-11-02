@@ -24,7 +24,6 @@ from headerkit import (  # noqa: E402
     Header,
     NimCleanupTransform,
     NimJsonDocEnricher,
-    generate_all,
     get_backend,
     get_writer,
 )
@@ -97,19 +96,6 @@ def generate_cdef_and_pyi(
     pyi_writer = get_writer("pyi", module_var="CDEF")
     cdef_str = cffi_writer.write(header_ir)
     pyi_str = pyi_writer.write(header_ir)
-
-    # Verify round-trip parity with headerkit.generate_all pipeline
-    outputs = generate_all(
-        header_path=target,
-        writers=["cffi", "pyi"],
-        include_dirs=[str(target.parent)],
-        no_cache=True,
-    )
-    output_map = {res.writer_name: res.output for res in outputs}
-    if not cdef_str:
-        cdef_str = output_map.get("cffi", "")
-    if not pyi_str:
-        pyi_str = output_map.get("pyi", "")
     return cdef_str, pyi_str
 
 

@@ -32,10 +32,6 @@ dependencies = [
     "naganim @ git+https://github.com/elijahr/naganim.git@feat/headerkit-roundtable-v2",
 ]
 
-[tool.uv.sources]
-headerkit = { path = "/Users/eek/Development/headerkit", editable = true }
-naganim = { path = "/Users/eek/Development/naganim", editable = true }
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
@@ -49,6 +45,9 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/lockless"]

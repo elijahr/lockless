@@ -1196,9 +1196,9 @@ proc ll_skiplist_put*(
   {.cast(gcsafe).}:
     try:
       let k = makeLlKey(key_kind, key_int, key_float, key_bytes, key_len)
-      var prevOpt = map.raw[].get(k)
       let box = allocPyKVBox(key_pyobj, val_pyobj)
-      let inserted = map.raw[].put(k, box)
+      var prevOpt = map.raw[].putPrev(k, box)
+      let inserted = prevOpt.isNone
       if out_inserted != nil:
         out_inserted[] = inserted
       if not inserted:
@@ -1274,16 +1274,15 @@ proc ll_skiplist_remove*(
   {.cast(gcsafe).}:
     try:
       let k = makeLlKey(key_kind, key_int, key_float, key_bytes, key_len)
-      # Hold `opt` (`Option[PyKVBox]`) in a local variable across `delete(k)` and
-      # `trySafeReclaim(th)` so `PyKVHolder.rc >= 1` is maintained until `out_val_pyobj[]`
-      # has been safely extracted, and `PyKVBox.=destroy` retires `keyObj`/`valObj`
-      # cleanly when `opt` exits scope.
-      var opt = map.raw[].get(k)
-      if map.raw[].delete(k):
+      # Hold `opt` (`Option[PyKVBox]`) returned by atomic `deletePrev(k)` in a local
+      # variable across `trySafeReclaim(th)` so `PyKVHolder.rc >= 1` is maintained
+      # until `out_val_pyobj[]` has been safely extracted, and `PyKVBox.=destroy`
+      # retires `keyObj`/`valObj` cleanly when `opt` exits scope.
+      var opt = map.raw[].deletePrev(k)
+      if opt.isSome:
         if out_val_pyobj != nil:
-          out_val_pyobj[] = if opt.isSome and opt.get.holder != nil: opt.get.holder.valObj else: nil
-        if opt.isSome:
-          retirePyKVHolderOnce(opt.get.holder)
+          out_val_pyobj[] = if opt.get.holder != nil: opt.get.holder.valObj else: nil
+        retirePyKVHolderOnce(opt.get.holder)
         let th = map.raw[].getOrRegisterHandle()
         trySafeReclaim(th)
         return LF_OK
