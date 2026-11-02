@@ -28,7 +28,13 @@ classifiers = [
 ]
 dependencies = [
     "cffi>=1.15.0",
+    "headerkit @ git+https://github.com/axiomantic/headerkit.git@feat/headerkit-roundtable-v2",
+    "naganim @ git+https://github.com/elijahr/naganim.git@feat/headerkit-roundtable-v2",
 ]
+
+[tool.uv.sources]
+headerkit = { path = "/Users/eek/Development/headerkit", editable = true }
+naganim = { path = "/Users/eek/Development/naganim", editable = true }
 
 [project.optional-dependencies]
 dev = [

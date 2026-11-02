@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 import tempfile
@@ -95,15 +94,9 @@ def generate_cdef_and_pyi(
     header_ir = parse_lockless_header(target, jsondoc_entries=jsondoc_entries)
 
     cffi_writer = get_writer("cffi")
-    pyi_writer = get_writer("pyi")
+    pyi_writer = get_writer("pyi", module_var="CDEF")
     cdef_str = cffi_writer.write(header_ir)
-    pyi_str = pyi_writer.write(header_ir).replace(
-        "from collections.abc import Callable\nimport enum\n",
-        "import enum\nfrom collections.abc import Callable\n",
-    )
-    pyi_str = re.sub(r"^(\s+[A-Z0-9_]+): int = ", r"\1 = ", pyi_str, flags=re.MULTILINE)
-    if "\nCDEF: str" not in pyi_str:
-        pyi_str = pyi_str.rstrip() + "\n\nCDEF: str\n"
+    pyi_str = pyi_writer.write(header_ir)
 
     # Verify round-trip parity with headerkit.generate_all pipeline
     outputs = generate_all(
