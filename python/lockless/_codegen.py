@@ -2,31 +2,20 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
-PACKAGE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = PACKAGE_DIR.parent.parent
-
-for _cand in (
-    REPO_ROOT.parent / "headerkit",
-    REPO_ROOT.parent.parent.parent / "headerkit",
-    REPO_ROOT.parent.parent.parent.parent / "headerkit",
-):
-    if (_cand / "headerkit" / "__init__.py").exists() and str(_cand) not in sys.path:
-        sys.path.insert(0, str(_cand))
-
-from headerkit import (  # noqa: E402
+from headerkit import (
     Header,
     NimCleanupTransform,
     NimJsonDocEnricher,
-    get_backend,
+    generate,
     get_writer,
+    json_to_header,
 )
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PACKAGE_DIR.parent.parent
 
 DEFAULT_HEADER_PATH = REPO_ROOT / "include" / "lockless_ext.h"
 DEFAULT_NIM_SOURCE_PATH = REPO_ROOT / "src" / "lockless_ext.nim"
@@ -38,48 +27,23 @@ def parse_lockless_header(
     header_path: Path | None = None,
     *,
     jsondoc_entries: list[dict[str, Any]] | None = None,
+    enrich_from_nim: bool = False,
 ) -> Header:
-    """Parse ``include/lockless_ext.h`` into HeaderKit IR with Nim cleanup and jsondoc enrichment."""
+    """Parse ``include/lockless_ext.h`` into HeaderKit IR via ``headerkit.generate``."""
     target = header_path if header_path is not None else DEFAULT_HEADER_PATH
-    code = target.read_text(encoding="utf-8")
-    backend = get_backend()
-    ir = backend.parse(code, str(target), include_dirs=[str(target.parent)])
-    cleaned = NimCleanupTransform().transform(ir)
+    transforms: list[Any] = [NimCleanupTransform()]
     if jsondoc_entries is not None:
-        cleaned = NimJsonDocEnricher(entries=jsondoc_entries).transform(cleaned)
-    return cleaned
-
-
-def extract_nim_jsondoc(nim_source_path: Path | None = None) -> list[dict[str, Any]]:
-    """Run ``nim jsondoc`` on ``src/lockless_ext.nim`` if Nim is available and return parsed entries."""
-    target = nim_source_path if nim_source_path is not None else DEFAULT_NIM_SOURCE_PATH
-    if not target.exists():
-        return []
-    with tempfile.TemporaryDirectory(prefix="lockless_jsondoc_") as tmp_dir:
-        out_json = Path(tmp_dir) / "lockless_ext.json"
-        cmd = [
-            "nim",
-            "jsondoc",
-            "--hints:off",
-            "--warnings:off",
-            f"-o:{out_json}",
-            str(target),
-        ]
-        proc = subprocess.run(
-            cmd,
-            cwd=str(target.parent.parent),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0 or not out_json.exists():
-            return []
-        raw = json.loads(out_json.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            return [entry for entry in raw if isinstance(entry, dict)]
-        if isinstance(raw, dict) and isinstance(raw.get("entries"), list):
-            return [entry for entry in raw["entries"] if isinstance(entry, dict)]
-        return []
+        transforms.append(NimJsonDocEnricher(entries=jsondoc_entries))
+    elif enrich_from_nim and DEFAULT_NIM_SOURCE_PATH.exists():
+        transforms.append(NimJsonDocEnricher(nim_source_path=DEFAULT_NIM_SOURCE_PATH))
+    ir_json = generate(
+        header_path=target,
+        writer_name="json",
+        include_dirs=[str(target.parent)],
+        transforms=transforms,
+        no_cache=True,
+    )
+    return json_to_header(ir_json)
 
 
 def generate_cdef_and_pyi(
@@ -89,8 +53,7 @@ def generate_cdef_and_pyi(
 ) -> tuple[str, str]:
     """Generate both the CFFI ``cdef`` declarations and PEP 484 ``.pyi`` stub via HeaderKit."""
     target = header_path if header_path is not None else DEFAULT_HEADER_PATH
-    jsondoc_entries = extract_nim_jsondoc() if enrich_from_nim else None
-    header_ir = parse_lockless_header(target, jsondoc_entries=jsondoc_entries)
+    header_ir = parse_lockless_header(target, enrich_from_nim=enrich_from_nim)
 
     cffi_writer = get_writer("cffi")
     pyi_writer = get_writer("pyi", module_var="CDEF")
