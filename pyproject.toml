@@ -28,8 +28,8 @@ classifiers = [
 ]
 dependencies = [
     "cffi>=1.15.0",
-    "headerkit @ git+https://github.com/axiomantic/headerkit.git@feat/headerkit-roundtable-v2",
-    "naganim @ git+https://github.com/elijahr/naganim.git@feat/headerkit-roundtable-v2",
+    "headerkit>=0.50.0",
+    "naganim @ git+https://github.com/elijahr/naganim.git",
 ]
 
 [project.optional-dependencies]
