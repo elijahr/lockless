@@ -1,5 +1,11 @@
 # lockless
 
+[![Status: Experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#status)
+
+> [!WARNING]
+> **Experimental / Pre-Alpha Software — Not Ready for Production**
+> This project is an active research and development prototype. APIs, ABI layouts, and wire formats are unstable and subject to breaking changes without notice. Do not use in production systems.
+
 Lock-free concurrent data structures and zero-copy DSP primitives for Python 3.10+ (standard CPython and free-threaded PEP 703 `python3.13t` / `python3.14t`), backed by [`lockfree`](https://github.com/axiomantic/lockfree).
 
 ## Primitives

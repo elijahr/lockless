@@ -4,6 +4,7 @@ All notable changes to `lockless` are documented in this file.
 
 ## [Unreleased]
 
+- Added Experimental / Pre-Alpha status badge and `[!WARNING]` callout in `README.md` and updated `pyproject.toml` classifier to `Development Status :: 2 - Pre-Alpha`.
 - Migrated `python/lockless/_codegen.py` (`parse_lockless_header`) to `headerkit`'s first-class `NimBackend` (`backend_name="nim"` and `clean_nim_c_unit`), removing references to the deleted `NimCleanupTransform` and `NimJsonDocEnricher` classes.
 - Refactored `python/lockless/_codegen.py` to delegate C header parsing and `NimCleanupTransform` / `NimJsonDocEnricher` transformations directly to `headerkit.generate()`, removing manual `backend.parse()`, the custom `extract_nim_jsondoc()` subprocess wrapper, and sibling relative `sys.path` / `pythonpath` overrides.
 - Replaced non-atomic `get(k)` + `put(k)` / `delete(k)` pre-read sequences in `ll_skiplist_put` and `ll_skiplist_remove` (`src/lockless_ext.nim`) with atomic `SkipListMap.putPrev` and `SkipListMap.deletePrev`, removed redundant double `generate_all()` parse in `python/lockless/_codegen.py`, and removed local `[tool.uv.sources]` path overrides from `pyproject.toml`.
