@@ -23,3 +23,6 @@ task build_ext, "Build liblockless_ext shared library for Python":
       "so"
   exec "nim c --app:lib --noMain --mm:orc --threads:on -d:useMalloc -d:noSignalHandler -d:release --out:python/lockless/liblockless_ext." & ext & " src/lockless_ext.nim"
 
+task build_lib, "Alias for build_ext (Build liblockless_ext shared library for Python)":
+  exec "nimble build_ext"
+

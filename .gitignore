@@ -1,3 +1,6 @@
+.garden/
+garden.toml
+vine.toml
 .vine.json
 .envrc
 .rhizo.*

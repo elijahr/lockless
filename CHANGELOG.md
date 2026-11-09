@@ -4,6 +4,7 @@ All notable changes to `lockless` are documented in this file.
 
 ## [Unreleased]
 
+- Prepared `lockless` for public release: added MIT `LICENSE`, aligned `pyproject.toml` metadata (`requires-python = ">=3.11"`, `naganim>=0.1.0`, `[project.urls]`, classifiers, `[tool.ruff]`, `[tool.mypy]`), added `nimble build_lib` alias, expanded `README.md`, and added `docs/index.md`, `docs/primitives.md`, and `docs/architecture.md`.
 - Added Experimental / Pre-Alpha status badge and `[!WARNING]` callout in `README.md` and updated `pyproject.toml` classifier to `Development Status :: 2 - Pre-Alpha`.
 - Migrated `python/lockless/_codegen.py` (`parse_lockless_header`) to `headerkit`'s first-class `NimBackend` (`backend_name="nim"` and `clean_nim_c_unit`), removing references to the deleted `NimCleanupTransform` and `NimJsonDocEnricher` classes.
 - Refactored `python/lockless/_codegen.py` to delegate C header parsing and `NimCleanupTransform` / `NimJsonDocEnricher` transformations directly to `headerkit.generate()`, removing manual `backend.parse()`, the custom `extract_nim_jsondoc()` subprocess wrapper, and sibling relative `sys.path` / `pythonpath` overrides.
