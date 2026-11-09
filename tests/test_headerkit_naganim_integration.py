@@ -30,6 +30,16 @@ def test_headerkit_codegen_pipeline_and_cdef_parity() -> None:
     assert "ll_ctrie_put" in func_names
     assert "lf_taskpool_parallel_for" in func_names
 
+    enriched_ir = parse_lockless_header(
+        DEFAULT_HEADER_PATH,
+        jsondoc_entries=[{"name": "naganim_init_runtime", "type": "skProc", "description": "Init runtime."}],
+    )
+    init_fn = next(
+        decl for decl in enriched_ir.declarations if isinstance(decl, Function) and decl.name == "naganim_init_runtime"
+    )
+    assert init_fn.doc == "Init runtime."
+    assert init_fn.source_meta is not None and init_fn.source_meta.source_language == "nim"
+
     cdef_str, pyi_str = generate_cdef_and_pyi(DEFAULT_HEADER_PATH, enrich_from_nim=False)
     assert cdef_str == cdef_generated.CDEF
     assert DEFAULT_CDEF_PY_PATH.exists() is True
