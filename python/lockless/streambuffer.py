@@ -441,13 +441,6 @@ class StreamBuffer:
             self._closed = True
             lib.lf_streambuffer_destroy(ptr)
 
-    def __enter__(self) -> StreamBuffer:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.close()
-
     def __del__(self) -> None:
         try:
             if not self._active_write_reservations and not self._active_read_reservations:

@@ -88,11 +88,8 @@ class Channel(Generic[T]):
             self._capacity = self._queue.capacity
 
         self._spsc = spsc
-        r_fd, w_fd = os.pipe()
-        os.set_blocking(r_fd, False)
-        os.set_blocking(w_fd, False)
-        self._r_fd = r_fd
-        self._w_fd = w_fd
+        self._r_fd = -1
+        self._w_fd = -1
 
         self._lock = threading.Lock()
         self._not_empty_cond = threading.Condition(self._lock)
@@ -175,12 +172,24 @@ class Channel(Generic[T]):
             ch._on_pipe_readable()
 
     def _ensure_loop_reader(self, loop: asyncio.AbstractEventLoop) -> None:
-        if loop not in self._registered_loops and self._r_fd >= 0:
-            try:
-                loop.add_reader(self._r_fd, Channel._weak_pipe_readable, weakref.ref(self))
-                self._registered_loops.add(loop)
-            except Exception:
-                pass
+        if loop in self._registered_loops:
+            return
+        with self._lock:
+            if self._closed or self._destroyed:
+                return
+            if self._r_fd < 0:
+                r_fd, w_fd = os.pipe()
+                os.set_blocking(r_fd, False)
+                os.set_blocking(w_fd, False)
+                self._r_fd = r_fd
+                self._w_fd = w_fd
+            if loop not in self._registered_loops and self._r_fd >= 0:
+                try:
+                    self_ref: weakref.ReferenceType[Channel[Any]] = weakref.ref(self)
+                    loop.add_reader(self._r_fd, Channel._weak_pipe_readable, self_ref)
+                    self._registered_loops.add(loop)
+                except Exception:
+                    pass
 
     def _remove_loop_readers(self) -> None:
         for loop in list(self._registered_loops):
@@ -442,12 +451,6 @@ class Channel(Generic[T]):
                 self._w_fd = -1
             self._queue.destroy()
 
-    def __enter__(self) -> Channel[T]:
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.close()
-
     def __del__(self) -> None:
         try:
             self.destroy()
@@ -607,13 +610,6 @@ class RendezvousChannel(Generic[T]):
             self._destroyed = True
             lib.lf_rendezvous_destroy(ptr)
             drain_deferred_decrefs()
-
-    def __enter__(self) -> RendezvousChannel[T]:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.close()
 
     def __del__(self) -> None:
         try:

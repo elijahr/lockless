@@ -159,25 +159,23 @@ def test_mpmc_multithreaded_contention() -> None:
     lock = threading.Lock()
 
     def producer_worker(pid: int) -> None:
-        with q.producer() as prod:
-            for i in range(items_per_producer):
-                while not prod.try_push((pid, i)):
-                    pass
+        for i in range(items_per_producer):
+            while not q.try_push((pid, i)):
+                pass
 
     def consumer_worker() -> None:
         local: list[tuple[int, int]] = []
-        with q.consumer() as cons:
-            while True:
-                item = cons.try_pop()
-                if item is not None:
-                    local.append(item)
-                elif q.is_closed and q.is_empty:
-                    # Final drain check
-                    rem = cons.try_pop()
-                    if rem is not None:
-                        local.append(rem)
-                    else:
-                        break
+        while True:
+            item = q.try_pop()
+            if item is not None:
+                local.append(item)
+            elif q.is_closed and q.is_empty:
+                # Final drain check
+                rem = q.try_pop()
+                if rem is not None:
+                    local.append(rem)
+                else:
+                    break
         with lock:
             collected.extend(local)
 
@@ -197,10 +195,10 @@ def test_mpmc_multithreaded_contention() -> None:
     assert sorted(collected) == expected
 
 
-def test_unbounded_mpmc_direct_multithreaded_and_handle_invalidation() -> None:
+def test_unbounded_mpmc_direct_multithreaded_and_destroy() -> None:
     uq: MpmcQueue[tuple[int, int]] = MpmcQueue(None)
-    prod_handle = uq.producer()
-    cons_handle = uq.consumer()
+    assert hasattr(uq, "producer") is False
+    assert hasattr(uq, "consumer") is False
 
     num_threads = 4
     items_per_thread = 100
@@ -238,14 +236,35 @@ def test_unbounded_mpmc_direct_multithreaded_and_handle_invalidation() -> None:
     expected = sorted((t, i) for t in range(num_threads) for i in range(items_per_thread))
     assert sorted(popped) == expected
 
-    # Destroying the queue must close all open producer/consumer handles
     uq.destroy()
     with pytest.raises(Closed):
-        prod_handle.push((0, 0))
+        uq.push((0, 0))
     with pytest.raises(Closed):
-        cons_handle.pop()
-    prod_handle.close()
-    cons_handle.close()
+        uq.pop()
+
+
+def test_queues_reject_context_manager_and_removed_handle_wrappers() -> None:
+    import lockless
+    import lockless.queues as queues_mod
+
+    assert hasattr(lockless, "MpmcProducer") is False
+    assert hasattr(lockless, "MpmcConsumer") is False
+    assert hasattr(queues_mod, "MpmcProducer") is False
+    assert hasattr(queues_mod, "MpmcConsumer") is False
+
+    mpmc = MpmcQueue[int](64)
+    assert hasattr(mpmc, "producer") is False
+    assert hasattr(mpmc, "consumer") is False
+
+    bq = BQueue128[int](128)
+    spsc = SpscQueue[int](64)
+
+    for q in (bq, spsc, mpmc):
+        assert hasattr(q, "__enter__") is False
+        assert hasattr(q, "__exit__") is False
+        with pytest.raises(TypeError), q:  # type: ignore[attr-defined]
+            pass
+        q.destroy()
 
 
 def test_spsc_queue_push_ex_and_concurrent_wakeup_accuracy() -> None:

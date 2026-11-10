@@ -295,13 +295,6 @@ class BroadcastRing(Generic[T]):
             lib.ll_broadcast_destroy(ptr)
             drain_deferred_decrefs()
 
-    def __enter__(self) -> BroadcastRing[T]:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.close()
-
     def __del__(self) -> None:
         try:
             self.destroy()
@@ -640,13 +633,6 @@ class ConcurrentDict(Generic[K, V]):
 
     close = destroy
 
-    def __enter__(self) -> ConcurrentDict[K, V]:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.destroy()
-
     def __del__(self) -> None:
         try:
             self.destroy()
@@ -847,13 +833,6 @@ class SkipListMap(Generic[K, V]):
 
     close = destroy
 
-    def __enter__(self) -> SkipListMap[K, V]:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.destroy()
-
     def __del__(self) -> None:
         try:
             self.destroy()
@@ -974,13 +953,6 @@ class SkipListSet(Generic[T]):
             drain_deferred_decrefs()
 
     close = destroy
-
-    def __enter__(self) -> SkipListSet[T]:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.destroy()
 
     def __del__(self) -> None:
         try:

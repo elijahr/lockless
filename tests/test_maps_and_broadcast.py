@@ -473,3 +473,33 @@ def test_debra_concurrent_readers_writers_and_snapshots_no_uaf() -> None:
     d.destroy()
     sm.destroy()
     drain_deferred_decrefs()
+
+
+def test_maps_and_broadcast_reject_container_context_managers() -> None:
+    ring = BroadcastRing[int](64)
+    cmap = ConcurrentDict[str, int]()
+    smap = SkipListMap[str, int]()
+    sset = SkipListSet[int]()
+
+    for container in (ring, cmap, smap, sset):
+        assert hasattr(container, "__enter__") is False
+        assert hasattr(container, "__exit__") is False
+        with pytest.raises(TypeError), container:  # type: ignore[attr-defined]
+            pass
+
+    # Positive control: Subscriber and ConcurrentDictSnapshot remain scoped context managers
+    with ring.subscribe() as sub:
+        ring.publish(7)
+        assert sub.poll() == 7
+    assert sub.is_closed is True
+
+    cmap["x"] = 42
+    with cmap.snapshot() as snap:
+        assert snap["x"] == 42
+    with pytest.raises(Closed):
+        _ = snap["x"]
+
+    ring.destroy()
+    cmap.destroy()
+    smap.destroy()
+    sset.destroy()

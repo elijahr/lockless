@@ -8,6 +8,23 @@ Complete guide and API reference for every primitive exported by `lockless`.
 
 ---
 
+## 0. Lifecycle Model: Long-Lived Containers vs. Scoped Context Managers
+
+`lockless` draws a strict boundary between **long-lived containers** and **scoped handles / reservations / worker pools**:
+
+1. **Long-Lived Containers** (`BQueue128`, `SpscQueue`, `MpmcQueue`, `StreamBuffer`, `BroadcastRing`, `ConcurrentDict`, `SkipListMap`, `SkipListSet`, `Channel`, `RendezvousChannel`, `TokenBucket`, `LeakyBucket`):
+   - Initialized in `__init__` (`q = BQueue128(256)`, `d = ConcurrentDict()`, etc.) and shared across threads or coroutines for their natural lifetime.
+   - Cleaned up automatically by Python garbage collection (`__del__`) or explicitly via `.close()` / `.destroy()`.
+   - Do **not** implement `__enter__` / `__exit__` (`with <container>:` raises `TypeError`).
+2. **Scoped Context Managers** (`with` supported exclusively here):
+   - `with sb.reserve_write(n) as (v1, v2):` (`StreamWriteReservation` — commits and releases zero-copy writable `memoryview` slices on clean exit, or aborts on exception)
+   - `with sb.peek_read() as (r1, r2):` (`StreamReadReservation` — releases zero-copy read-only `memoryview` slices on exit)
+   - `with ring.subscribe() as sub:` (`Subscriber` — detaches the reader cursor from `BroadcastRing` on exit)
+   - `with d.snapshot() as snap:` (`ConcurrentDictSnapshot` — releases the $O(1)$ point-in-time Ctrie snapshot on exit)
+   - `with TaskPool(num_workers=4) as pool:` (`TaskPool` — synchronizes in-flight tasks and shuts down native OS worker threads on exit)
+
+---
+
 ## 1. Exceptions & Diagnostics (`lockless`)
 
 - **`LocklessError(Exception)`**: Base exception class for all `lockless` errors.
@@ -43,18 +60,31 @@ Wait-free Lamport Single-Producer Single-Consumer ring buffer using a `2 * (N + 
 - **`SpscQueue(capacity: int = 1024)`** — `capacity` must be a power of 2 in `[2, 65536]`.
 - **Properties & Methods**: Same API as `BQueue128[T]` (`capacity`, `is_closed`, `is_empty`, `is_full`, `__len__`, `push`, `push_ex`, `try_push`, `put_nowait`, `pop`, `get_nowait`, `try_pop`, `pop_batch`, `clear`, `close`, `destroy`). `pop_batch` executes a single C-ABI batch call (`ll_spsc_pop_batch`).
 
-### 2.3 `MpmcQueue[T]`, `MpmcProducer[T]`, `MpmcConsumer[T]`
+### 2.3 `MpmcQueue[T]`
 Lock-free Multi-Producer Multi-Consumer (and MPSC / SPMC) queue:
 - When `capacity` is a power of 2 in `[2, 65536]`, uses a bounded Vyukov MPMC ring.
 - When `capacity=None` (or `0`), uses an unbounded lock-free Michael-Scott queue with DEBRA+ epoch-based safe memory reclamation.
 
 - **`MpmcQueue(capacity: int | None = 1024)`**
 - **Properties**: `.capacity -> int | None`, `.is_closed -> bool`, `.is_empty -> bool`, `.is_full -> bool`, `len(q) -> int`.
-- **Handle Factories**:
-  - `producer() -> MpmcProducer[T]`: Acquires an explicit producer handle (`push`, `push_ex`, `try_push`, `close`).
-  - `consumer() -> MpmcConsumer[T]`: Acquires an explicit consumer handle (`pop`, `try_pop`, `pop_batch`, `close`).
-- **Direct Queue Methods** (using per-thread default handles automatically):
+- **Methods** (managing native handles internally per thread where needed):
   `push`, `push_ex`, `try_push`, `put_nowait`, `pop`, `get_nowait`, `try_pop`, `pop_batch`, `clear`, `close`, `destroy`.
+
+```python
+from lockless import BQueue128, MpmcQueue, SpscQueue
+
+q = BQueue128[int](256)
+q.push(1)
+assert q.pop() == 1
+
+spsc = SpscQueue[str](64)
+spsc.push("ok")
+assert spsc.pop() == "ok"
+
+mpmc = MpmcQueue[int](1024)
+mpmc.push(42)
+assert mpmc.pop() == 42
+```
 
 ---
 
@@ -82,7 +112,7 @@ Wait-free SPSC byte ring buffer exposing zero-copy bipartite `memoryview` reserv
 ## 4. Synchronous & `asyncio` Channels (`lockless.channels`)
 
 ### 4.1 `Channel[T]`
-Hybrid synchronous and `asyncio` channel combining a lock-free queue (`MpmcQueue` by default, or wait-free `BQueue128` when `spsc=True` and `128 <= capacity <= 16384`) with a 0-to-1 OS wakeup pipe and Dekker store-load fence.
+Hybrid synchronous and `asyncio` channel combining a lock-free queue (`MpmcQueue` by default, or wait-free `BQueue128` when `spsc=True` and `128 <= capacity <= 16384`) with a lazily allocated 0-to-1 OS wakeup pipe and Dekker store-load fence. Synchronous channels initialize `_r_fd = -1` and `_w_fd = -1` (consuming 0 OS file descriptors) and only allocate the `os.pipe()` when an `asyncio` reader first attaches via `recv_async()` / `async for`.
 
 - **`Channel(capacity: int | None = 1024, *, spsc: bool = False)`**
 - **Non-Blocking Methods**:

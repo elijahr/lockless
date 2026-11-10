@@ -6,7 +6,7 @@ import inspect
 import threading
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from ._cabi import (
     LF_OK,
@@ -71,7 +71,7 @@ def _for_trampoline(index: int, arg: Any) -> None:
             errors.append(exc)
 
 
-_FOR_TRAMPOLINE_ADDR = int(ffi.cast("uintptr_t", _for_trampoline))
+_FOR_TRAMPOLINE_ADDR = int(ffi.cast("uintptr_t", cast(Any, _for_trampoline)))
 
 
 class TaskPool:

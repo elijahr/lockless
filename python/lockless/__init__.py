@@ -26,8 +26,6 @@ from .maps import (
 )
 from .queues import (
     BQueue128,
-    MpmcConsumer,
-    MpmcProducer,
     MpmcQueue,
     SpscQueue,
 )
@@ -58,8 +56,6 @@ __all__ = [
     "BQueue128",
     "SpscQueue",
     "MpmcQueue",
-    "MpmcProducer",
-    "MpmcConsumer",
     # Zero-copy byte stream ring
     "StreamBuffer",
     "StreamWriteReservation",

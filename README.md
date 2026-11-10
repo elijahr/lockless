@@ -19,7 +19,7 @@ Python's `queue.Queue`, `collections.deque` locks, and `asyncio.Queue` serialize
 `lockless` exposes native C-ABI lock-free and wait-free primitives compiled from Nim's `lockfree` library (`src/lockless_ext.nim`) with:
 - **Wait-free deferred `Py_DecRef` reclamation (`naganim/gc_bridge`)**: When DEBRA+ safe memory reclamation (SMR) or ring eviction (`omDropOldest`) retires a `PyObject*` on any thread, the pointer is queued wait-free and decremented safely without lock-order inversions against the GIL.
 - **Zero-copy bipartite `memoryview` DSP streaming (`StreamBuffer`)**: Direct `reserve_write` and `peek_read` access to native ring memory without intermediate `bytes` copies.
-- **Zero-polling `asyncio` integration (`Channel`)**: 0-to-1 edge-triggered OS wakeup pipes (`lf_bqueue128_push_ex`) paired with a Dekker store-load fence so `async for` and `await ch.recv_async()` never poll and never miss wakeups.
+- **Zero-polling `asyncio` integration (`Channel`)**: 0-to-1 edge-triggered OS wakeup pipes (`lf_bqueue128_push_ex`) allocated lazily on first async reader attachment (`_ensure_loop_reader`) and paired with a Dekker store-load fence so synchronous channels consume 0 OS file descriptors while `async for` and `await ch.recv_async()` never poll and never miss wakeups.
 - **HeaderKit `NimBackend` C-ABI codegen (`python/lockless/_codegen.py`)**: Automatically generates CFFI `CDEF` declarations and PEP 484 `.pyi` stubs from `include/lockless_ext.h` and `src/lockless_ext.nim`.
 
 ```mermaid
@@ -88,6 +88,23 @@ uv pip install -e .
 
 ---
 
+## Lifecycle & Scoped Context Managers
+
+`lockless` distinguishes between **long-lived containers** and **scoped handles / reservations / worker pools**:
+
+1. **Long-Lived Containers** (`BQueue128`, `SpscQueue`, `MpmcQueue`, `StreamBuffer`, `BroadcastRing`, `ConcurrentDict`, `SkipListMap`, `SkipListSet`, `Channel`, `RendezvousChannel`, `TokenBucket`, `LeakyBucket`):
+   - Initialized directly in `__init__` (`q = BQueue128(256)`, `d = ConcurrentDict()`, etc.) and shared across threads or tasks for their natural lifetime.
+   - Cleaned up automatically by Python garbage collection (`__del__`) or explicitly via `.close()` / `.destroy()`.
+   - Do **not** implement `__enter__` / `__exit__` (`with <container>:` raises `TypeError`).
+2. **Scoped Reservations, Reader Cursors, Snapshots & Worker Pools** (`with` supported exclusively here):
+   - `with sb.reserve_write(n) as (v1, v2):` (`StreamWriteReservation` — commits and releases zero-copy writable `memoryview` slices on clean exit, or aborts on exception)
+   - `with sb.peek_read() as (r1, r2):` (`StreamReadReservation` — releases zero-copy read-only `memoryview` slices on exit)
+   - `with ring.subscribe() as sub:` (`Subscriber` — detaches the reader cursor from `BroadcastRing` on exit)
+   - `with d.snapshot() as snap:` (`ConcurrentDictSnapshot` — releases the $O(1)$ point-in-time Ctrie snapshot on exit)
+   - `with TaskPool(num_workers=4) as pool:` (`TaskPool` — synchronizes in-flight tasks and shuts down native OS worker threads on exit)
+
+---
+
 ## Usage Examples by Module
 
 ### 1. Queues (`lockless.queues`: `BQueue128`, `SpscQueue`, `MpmcQueue`)
@@ -98,63 +115,67 @@ uv pip install -e .
 from lockless import BQueue128, MpmcQueue, SpscQueue
 
 # 1. BQueue128: Wait-free 128-bit batched SPSC ring buffer (capacity power of 2 in [128, 16384])
-with BQueue128[int](capacity=256) as bq:
-    was_empty = bq.push_ex(10)  # True on 0 -> 1 transition
-    bq.push(20)
-    assert bq.pop() == 10
-    assert bq.pop_batch(max_count=16) == [20]
+bq = BQueue128[int](capacity=256)
+was_empty = bq.push_ex(10)  # True on 0 -> 1 transition
+bq.push(20)
+assert bq.pop() == 10
+assert bq.pop_batch(max_count=16) == [20]
+bq.destroy()
 
 # 2. SpscQueue: Wait-free Lamport SPSC ring buffer (capacity power of 2 in [2, 65536])
-with SpscQueue[str](capacity=64) as spsc:
-    spsc.push("alpha")
-    spsc.push("beta")
-    assert spsc.pop() == "alpha"
-    assert spsc.try_pop() == "beta"
-    assert spsc.try_pop(default=None) is None
+spsc = SpscQueue[str](capacity=64)
+spsc.push("alpha")
+spsc.push("beta")
+assert spsc.pop() == "alpha"
+assert spsc.try_pop() == "beta"
+assert spsc.try_pop(default=None) is None
+spsc.destroy()
 
-# 3. MpmcQueue (bounded MPSC / MPMC): Vyukov ring with dedicated producer/consumer handles
-with MpmcQueue[dict[str, int]](capacity=1024) as mpmc:
-    with mpmc.producer() as prod, mpmc.consumer() as cons:
-        prod.push({"seq": 1})
-        prod.push({"seq": 2})
-        assert cons.pop_batch(max_count=10) == [{"seq": 1}, {"seq": 2}]
+# 3. MpmcQueue (bounded MPSC / MPMC): Vyukov ring
+mpmc = MpmcQueue[dict[str, int]](capacity=1024)
+mpmc.push({"seq": 1})
+mpmc.push({"seq": 2})
+assert mpmc.pop_batch(max_count=10) == [{"seq": 1}, {"seq": 2}]
+mpmc.destroy()
 
 # 4. Unbounded MpmcQueue (capacity=None): Lock-free Michael-Scott queue with DEBRA+ SMR
-with MpmcQueue[int](capacity=None) as unbounded_q:
-    for i in range(1000):
-        unbounded_q.push(i)
-    assert len(unbounded_q) == 1000
-    assert unbounded_q.pop() == 0
+unbounded_q = MpmcQueue[int](capacity=None)
+for i in range(1000):
+    unbounded_q.push(i)
+assert len(unbounded_q) == 1000
+assert unbounded_q.pop() == 0
+unbounded_q.destroy()
 ```
 
 ### 2. Zero-Copy DSP Byte Stream Ring (`lockless.streambuffer`: `StreamBuffer`)
 
-`StreamBuffer` provides two-phase zero-copy `reserve_write` and `peek_read` context managers that yield bipartite `(first_view, second_view)` `memoryview` pairs (handling ring wrap-around without copying):
+`StreamBuffer` is a long-lived ring buffer whose two-phase zero-copy `reserve_write` and `peek_read` methods return scoped context managers yielding bipartite `(first_view, second_view)` `memoryview` pairs (handling ring wrap-around without copying):
 
 ```python
 from lockless import StreamBuffer
 
-with StreamBuffer(capacity=4096) as sb:
-    payload = b"zero-copy-audio-frame"
+sb = StreamBuffer(capacity=4096)
+payload = b"zero-copy-audio-frame"
 
-    # Zero-copy two-phase write reservation (automatically commits on clean exit)
-    with sb.reserve_write(len(payload)) as (v1, v2):
-        n1 = min(len(v1), len(payload))
-        v1[:n1] = payload[:n1]
-        if n1 < len(payload):
-            v2[: len(payload) - n1] = payload[n1:]
+# Zero-copy two-phase write reservation (automatically commits & releases views on clean exit)
+with sb.reserve_write(len(payload)) as (v1, v2):
+    n1 = min(len(v1), len(payload))
+    v1[:n1] = payload[:n1]
+    if n1 < len(payload):
+        v2[: len(payload) - n1] = payload[n1:]
 
-    # Zero-copy two-phase read peek (read-only memoryview pair)
-    with sb.peek_read() as (r1, r2):
-        reconstructed = bytes(r1) + bytes(r2)
-        assert reconstructed == payload
-    sb.consume_read(len(payload))
-    assert sb.is_empty
+# Zero-copy two-phase read peek (read-only memoryview pair released on exit)
+with sb.peek_read() as (r1, r2):
+    reconstructed = bytes(r1) + bytes(r2)
+    assert reconstructed == payload
+sb.consume_read(len(payload))
+assert sb.is_empty
+sb.destroy()
 ```
 
 ### 3. Sync & Async Channels (`lockless.channels`: `Channel`, `RendezvousChannel`)
 
-`Channel` supports both synchronous thread blocking (`send` / `recv`) and zero-polling `asyncio` (`send_async` / `recv_async` / `async for`) using a 0-to-1 edge-triggered OS wakeup pipe and Dekker fence. `RendezvousChannel` provides zero-capacity synchronous and async handoffs:
+`Channel` supports both synchronous thread blocking (`send` / `recv`) and zero-polling `asyncio` (`send_async` / `recv_async` / `async for`) using a lazily allocated 0-to-1 edge-triggered OS wakeup pipe and Dekker fence (synchronous channels allocate 0 OS file descriptors). `RendezvousChannel` provides zero-capacity synchronous and async handoffs:
 
 ```python
 import asyncio
@@ -162,26 +183,29 @@ import threading
 from lockless import Channel, RendezvousChannel
 
 async def channel_example() -> None:
-    # Bounded SPSC or MPMC channel with zero-polling asyncio wakeup
-    with Channel[int](capacity=128, spsc=True) as ch:
-        await ch.send_async(1)
-        await ch.send_async(2)
-        ch.close()
+    # Bounded SPSC or MPMC channel with lazy zero-polling asyncio wakeup pipe
+    ch = Channel[int](capacity=128, spsc=True)
+    await ch.send_async(1)
+    await ch.send_async(2)
+    ch.close()
 
-        items = [x async for x in ch]
-        assert items == [1, 2]
+    items = [x async for x in ch]
+    assert items == [1, 2]
+    ch.destroy()
 
     # Zero-capacity RendezvousChannel handoff across threads / coroutines
-    with RendezvousChannel[str]() as rv:
-        def sender_thread() -> None:
-            corr_id = rv.send("direct-handoff", timeout=2.0)
-            assert corr_id > 0
+    rv = RendezvousChannel[str]()
 
-        t = threading.Thread(target=sender_thread)
-        t.start()
-        msg = await rv.recv_async(timeout=2.0)
-        t.join()
-        assert msg == "direct-handoff"
+    def sender_thread() -> None:
+        corr_id = rv.send("direct-handoff", timeout=2.0)
+        assert corr_id > 0
+
+    t = threading.Thread(target=sender_thread)
+    t.start()
+    msg = await rv.recv_async(timeout=2.0)
+    t.join()
+    assert msg == "direct-handoff"
+    rv.destroy()
 
 asyncio.run(channel_example())
 ```
@@ -191,30 +215,34 @@ asyncio.run(channel_example())
 ```python
 from lockless import BroadcastRing, ConcurrentDict, SkipListMap, SkipListSet
 
-# 1. ConcurrentDict (Ctrie) with O(1) linearizable snapshot()
-with ConcurrentDict[str, int]({"a": 1, "b": 2}) as cmap:
-    cmap.put_if_absent("c", 3)
-    with cmap.snapshot() as snap:
-        cmap["a"] = 99  # Mutating live map does not affect O(1) snapshot
-        assert snap["a"] == 1
-        assert cmap["a"] == 99
+# 1. ConcurrentDict (Ctrie) with scoped O(1) linearizable snapshot()
+cmap = ConcurrentDict[str, int]({"a": 1, "b": 2})
+cmap.put_if_absent("c", 3)
+with cmap.snapshot() as snap:
+    cmap["a"] = 99  # Mutating live map does not affect O(1) snapshot
+    assert snap["a"] == 1
+    assert cmap["a"] == 99
+cmap.destroy()
 
 # 2. SkipListMap & SkipListSet: Lock-free sorted containers (supports int, float, str, bytes, tuples)
-with SkipListMap[tuple[int, str], str]() as slm:
-    slm[(20, "b")] = "second"
-    slm[(10, "a")] = "first"
-    assert slm.keys() == [(10, "a"), (20, "b")]
+slm = SkipListMap[tuple[int, str], str]()
+slm[(20, "b")] = "second"
+slm[(10, "a")] = "first"
+assert slm.keys() == [(10, "a"), (20, "b")]
+slm.destroy()
 
-with SkipListSet[int]([30, 10, 20]) as sls:
-    sls.add(15)
-    assert sls.to_list() == [10, 15, 20, 30]
+sls = SkipListSet[int]([30, 10, 20])
+sls.add(15)
+assert sls.to_list() == [10, 15, 20, 30]
+sls.destroy()
 
-# 3. BroadcastRing: Multi-subscriber pub/sub ring buffer
-with BroadcastRing[str](capacity=64, overflow="drop_oldest", max_readers=8) as ring:
-    with ring.subscribe() as sub1, ring.subscribe() as sub2:
-        ring.publish("event-1")
-        assert sub1.poll() == "event-1"
-        assert sub2.poll() == "event-1"
+# 3. BroadcastRing: Multi-subscriber pub/sub ring buffer with scoped Subscriber cursors
+ring = BroadcastRing[str](capacity=64, overflow="drop_oldest", max_readers=8)
+with ring.subscribe() as sub1, ring.subscribe() as sub2:
+    ring.publish("event-1")
+    assert sub1.poll() == "event-1"
+    assert sub2.poll() == "event-1"
+ring.destroy()
 ```
 
 ### 5. Work-Stealing Thread Pool (`lockless.taskpool`: `TaskPool`)
@@ -242,14 +270,16 @@ with TaskPool(num_workers=4) as pool:
 from lockless import LeakyBucket, TokenBucket
 
 # TokenBucket: 128-bit CAS token bucket (burst capacity + steady-state refill_rate/sec)
-with TokenBucket(capacity=10, refill_rate=100) as tb:
-    assert tb.try_acquire(5) is True
-    assert tb.acquire(2, timeout=0.1) is True
+tb = TokenBucket(capacity=10, refill_rate=100)
+assert tb.try_acquire(5) is True
+assert tb.acquire(2, timeout=0.1) is True
+tb.destroy()
 
 # LeakyBucket: GCRA leaky bucket rate meter (capacity + leak_rate/sec)
-with LeakyBucket(capacity=10, leak_rate=100) as lb:
-    assert lb.try_acquire(1) is True
-    assert lb.acquire(1, timeout=0.1) is True
+lb = LeakyBucket(capacity=10, leak_rate=100)
+assert lb.try_acquire(1) is True
+assert lb.acquire(1, timeout=0.1) is True
+lb.destroy()
 ```
 
 ---

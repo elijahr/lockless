@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from ._cabi import (
     Closed,
     cdll,
@@ -104,13 +102,6 @@ class TokenBucket:
             lib.lf_token_bucket_destroy(ptr)
 
     close = destroy
-
-    def __enter__(self) -> TokenBucket:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.destroy()
 
     def __del__(self) -> None:
         try:
@@ -222,13 +213,6 @@ class LeakyBucket:
             lib.lf_leaky_bucket_destroy(ptr)
 
     close = destroy
-
-    def __enter__(self) -> LeakyBucket:
-        self._check_alive()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.destroy()
 
     def __del__(self) -> None:
         try:

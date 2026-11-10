@@ -26,11 +26,15 @@ for _naganim_cand in (
         sys.path.insert(0, str(_naganim_cand))
 
 try:
-    from naganim._cffi_loader import NaganimRuntimeError
+    from naganim._cffi_loader import NaganimRuntimeError as _NaganimRuntimeError
+
+    NaganimRuntimeError: type[RuntimeError] = _NaganimRuntimeError
 except ImportError:
 
-    class NaganimRuntimeError(RuntimeError):  # type: ignore[no-redef]
+    class _FallbackNaganimRuntimeError(RuntimeError):
         """Fallback runtime error when naganim Python package is not installed."""
+
+    NaganimRuntimeError = _FallbackNaganimRuntimeError
 
 # ==============================================================================
 # Exception Hierarchy

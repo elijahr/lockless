@@ -11,7 +11,7 @@
 ## Documentation Guide
 
 1. [**Primitives Guide & Complete API Reference (`primitives.md`)**](primitives.md)
-   - Queues (`BQueue128`, `SpscQueue`, `MpmcQueue`, `MpmcProducer`, `MpmcConsumer`)
+   - Queues (`BQueue128`, `SpscQueue`, `MpmcQueue`)
    - Zero-Copy Byte Stream Ring (`StreamBuffer`, `StreamWriteReservation`, `StreamReadReservation`)
    - Synchronous & `asyncio` Channels (`Channel`, `RendezvousChannel`)
    - Lock-Free Maps, Sets & Pub/Sub (`ConcurrentDict` / `Ctrie`, `ConcurrentDictSnapshot`, `SkipListMap`, `SkipListSet`, `BroadcastRing`, `Subscriber`)
@@ -21,7 +21,7 @@
 2. [**Architecture & C-ABI Bridge (`architecture.md`)**](architecture.md)
    - How `lockless` bridges `elijahr/lockfree` via `naganim` (`gc_bridge` borrow guards & wait-free deferred `Py_DecRef`) and `headerkit` (`NimBackend` C-ABI codegen)
    - Zero-pickle lexicographical key encoding for `ConcurrentDict`, `SkipListMap`, and `SkipListSet`
-   - Zero-polling 0-to-1 OS pipe wakeup and Dekker store-load fence in `Channel`
+   - Zero-polling 0-to-1 lazy OS pipe wakeup and Dekker store-load fence in `Channel`
 
 ---
 
@@ -44,15 +44,15 @@ from lockless import (
     TokenBucket,
 )
 
-# Wait-free SPSC queue
-with BQueue128[str](capacity=128) as q:
-    q.push("hello")
-    assert q.pop() == "hello"
+# Wait-free SPSC queue (long-lived container)
+q = BQueue128[str](capacity=128)
+q.push("hello")
+assert q.pop() == "hello"
 
-# Lock-free Ctrie with O(1) point-in-time snapshot
-with ConcurrentDict[str, int]({"workers": 8}) as d:
-    with d.snapshot() as snap:
-        d["workers"] = 16
-        assert snap["workers"] == 8
-        assert d["workers"] == 16
+# Lock-free Ctrie (long-lived container) with scoped O(1) point-in-time snapshot
+d = ConcurrentDict[str, int]({"workers": 8})
+with d.snapshot() as snap:
+    d["workers"] = 16
+    assert snap["workers"] == 8
+    assert d["workers"] == 16
 ```

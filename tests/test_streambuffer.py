@@ -101,6 +101,10 @@ def test_streambuffer_negative_controls() -> None:
         StreamBuffer("64")  # type: ignore[arg-type]
 
     sb = StreamBuffer(16)
+    assert hasattr(sb, "__enter__") is False
+    assert hasattr(sb, "__exit__") is False
+    with pytest.raises(TypeError), sb:  # type: ignore[attr-defined]
+        pass
     with pytest.raises(Full):
         sb.reserve_write(17)
 

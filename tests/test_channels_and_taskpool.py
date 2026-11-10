@@ -23,6 +23,11 @@ def test_channel_sync_and_negative_controls() -> None:
     ch: Channel[int] = Channel(capacity=4)
     assert ch.capacity == 4
     assert ch.is_empty is True
+    assert ch._r_fd == -1 and ch._w_fd == -1
+    assert hasattr(ch, "__enter__") is False
+    assert hasattr(ch, "__exit__") is False
+    with pytest.raises(TypeError), ch:  # type: ignore[attr-defined]
+        pass
 
     for i in range(4):
         assert ch.try_send(i) is True
@@ -32,12 +37,14 @@ def test_channel_sync_and_negative_controls() -> None:
         ch.send_nowait(99)
 
     assert [ch.recv() for _ in range(4)] == [0, 1, 2, 3]
+    assert ch._r_fd == -1 and ch._w_fd == -1
     assert ch.try_recv("empty") == "empty"
     with pytest.raises(Empty):
         ch.recv_nowait()
 
     ch.close()
     assert ch.is_closed is True
+    assert ch._r_fd == -1 and ch._w_fd == -1
     with pytest.raises(Closed):
         ch.send(1)
     with pytest.raises(Closed):
@@ -47,6 +54,7 @@ def test_channel_sync_and_negative_controls() -> None:
 def test_channel_async_for_and_0_to_1_wakeup() -> None:
     async def run_scenario() -> list[int]:
         ch: Channel[int] = Channel(capacity=128, spsc=True)
+        assert ch._r_fd == -1 and ch._w_fd == -1
         received: list[int] = []
 
         def background_producer() -> None:
@@ -61,9 +69,12 @@ def test_channel_async_for_and_0_to_1_wakeup() -> None:
         prod_thread.start()
 
         async for item in ch:
+            assert ch._r_fd >= 0 and ch._w_fd >= 0
             received.append(item)
 
         prod_thread.join()
+        ch.destroy()
+        assert ch._r_fd == -1 and ch._w_fd == -1
         return received
 
     result = asyncio.run(run_scenario())
@@ -73,6 +84,10 @@ def test_channel_async_for_and_0_to_1_wakeup() -> None:
 def test_rendezvous_channel_handoff_and_controls() -> None:
     rv: RendezvousChannel[str] = RendezvousChannel()
     assert rv.is_closed is False
+    assert hasattr(rv, "__enter__") is False
+    assert hasattr(rv, "__exit__") is False
+    with pytest.raises(TypeError), rv:  # type: ignore[attr-defined]
+        pass
 
     # Negative controls: try_send and try_recv return False / default when no peer is waiting
     assert rv.try_send("lonely") is False
@@ -183,6 +198,10 @@ def test_channel_async_weakref_gc_cleanup() -> None:
 
 def test_token_bucket_and_leaky_bucket() -> None:
     tb = TokenBucket(capacity=10, refill_rate=1000)
+    assert hasattr(tb, "__enter__") is False
+    assert hasattr(tb, "__exit__") is False
+    with pytest.raises(TypeError), TokenBucket(10, 10):  # type: ignore[attr-defined]
+        pass
     assert tb.capacity == 10
     assert tb.refill_rate == 1000
     assert tb.available == 10
@@ -196,6 +215,10 @@ def test_token_bucket_and_leaky_bucket() -> None:
     tb.destroy()
 
     lb = LeakyBucket(capacity=5, leak_rate=1000)
+    assert hasattr(lb, "__enter__") is False
+    assert hasattr(lb, "__exit__") is False
+    with pytest.raises(TypeError), LeakyBucket(10, 10):  # type: ignore[attr-defined]
+        pass
     assert lb.capacity == 5
     assert lb.leak_rate == 1000
     assert lb.try_acquire(5) is True
