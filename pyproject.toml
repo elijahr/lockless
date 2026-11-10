@@ -28,7 +28,7 @@ classifiers = [
 ]
 dependencies = [
     "cffi>=1.15.0",
-    "headerkit>=0.50.0",
+    "headerkit>=0.51.0",
     "naganim>=0.1.0",
 ]
 
