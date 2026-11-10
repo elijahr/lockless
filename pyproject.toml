@@ -5,32 +5,37 @@ build-backend = "hatchling.build"
 [project]
 name = "lockless"
 version = "0.1.0"
-description = "Lock-free concurrent data structures and zero-copy DSP primitives for Python 3.10+"
+description = "Lock-free concurrent data structures and zero-copy DSP primitives for Python 3.11+"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [
-    { name = "Axiomantic" },
+    { name = "Elijah R / Axiomantic" },
 ]
-keywords = ["lock-free", "concurrency", "queue", "ring-buffer", "dsp", "ctrie", "skiplist", "asyncio"]
+keywords = ["lock-free", "wait-free", "concurrency", "queue", "ring-buffer", "dsp", "ctrie", "skiplist", "asyncio", "freethreading"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 2 - Pre-Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
     "Topic :: Software Development :: Libraries",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
     "cffi>=1.15.0",
-    "headerkit>=0.50.0",
-    "naganim @ git+https://github.com/elijahr/naganim.git",
+    "headerkit>=0.51.0",
+    "naganim>=0.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/elijahr/lockless"
+Repository = "https://github.com/elijahr/lockless"
+Issues = "https://github.com/elijahr/lockless/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -45,9 +50,6 @@ dev = [
     "ruff>=0.4.0",
     "mypy>=1.10.0",
 ]
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["python/lockless"]
@@ -64,7 +66,7 @@ testpaths = ["tests"]
 pythonpath = ["python"]
 
 [tool.ruff]
-target-version = "py310"
+target-version = "py311"
 line-length = 100
 extend-exclude = [".headerkit"]
 
@@ -73,7 +75,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 ignore = ["E501", "SIM105"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 strict = true
 mypy_path = ["python"]
 
@@ -81,5 +83,3 @@ mypy_path = ["python"]
 module = ["cffi", "cffi.*", "headerkit", "headerkit.*", "naganim", "naganim.*"]
 ignore_missing_imports = true
 follow_imports = "silent"
-
-

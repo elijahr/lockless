@@ -7,12 +7,11 @@ from typing import Any
 
 from headerkit import (
     Header,
-    NimCleanupTransform,
-    NimJsonDocEnricher,
     generate,
     get_writer,
     json_to_header,
 )
+from headerkit.backends.nim import clean_nim_c_unit
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_DIR.parent.parent
@@ -31,19 +30,22 @@ def parse_lockless_header(
 ) -> Header:
     """Parse ``include/lockless_ext.h`` into HeaderKit IR via ``headerkit.generate``."""
     target = header_path if header_path is not None else DEFAULT_HEADER_PATH
-    transforms: list[Any] = [NimCleanupTransform()]
-    if jsondoc_entries is not None:
-        transforms.append(NimJsonDocEnricher(entries=jsondoc_entries))
-    elif enrich_from_nim and DEFAULT_NIM_SOURCE_PATH.exists():
-        transforms.append(NimJsonDocEnricher(nim_source_path=DEFAULT_NIM_SOURCE_PATH))
     ir_json = generate(
         header_path=target,
         writer_name="json",
+        backend_name="nim",
         include_dirs=[str(target.parent)],
-        transforms=transforms,
         no_cache=True,
     )
-    return json_to_header(ir_json)
+    unit = json_to_header(ir_json)
+    if jsondoc_entries is not None or (enrich_from_nim and DEFAULT_NIM_SOURCE_PATH.exists()):
+        nim_src = DEFAULT_NIM_SOURCE_PATH if (enrich_from_nim and DEFAULT_NIM_SOURCE_PATH.exists()) else None
+        unit = clean_nim_c_unit(
+            unit,
+            jsondoc_entries=jsondoc_entries,
+            nim_source_path=nim_src,
+        )
+    return unit
 
 
 def generate_cdef_and_pyi(
